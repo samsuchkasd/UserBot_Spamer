@@ -5,28 +5,21 @@
 ## Деплой на Railway
 
 1. Подключи этот репозиторий на [railway.app](https://railway.app)
-2. В Variables укажи:
+2. В Variables добавь **только**:
 
 | Переменная | Описание |
 |---|---|
-| `API_ID` | Из [my.telegram.org](https://my.telegram.org) |
-| `API_HASH` | Из [my.telegram.org](https://my.telegram.org) |
 | `SESSION_STRING` | Сессия первого аккаунта |
 | `SESSION_STRING1` | Сессия второго аккаунта (опционально) |
 | `SESSION_STRING2` | Сессия третьего аккаунта (опционально) |
+
+> `API_ID` и `API_HASH` уже вшиты в код — ничего больше настраивать не нужно.
 
 > Добавляй `SESSION_STRING3`, `SESSION_STRING4` и т.д. для новых аккаунтов — бот подхватит их автоматически после рестарта.
 
 ## Как получить SESSION_STRING
 
-```bash
-pip install pyrogram TgCrypto
-python -c "
-from pyrogram import Client
-app = Client('my_session', api_id=YOUR_API_ID, api_hash='YOUR_API_HASH')
-app.run(print(app.export_session_string()))
-"
-```
+Используй бота [@SessionStringGeneratorBot](https://t.me/SessionStringGeneratorBot) (или аналоги — SessionPhazerBot и т.п.) — они дадут готовую строку сессии без лишних действий.
 
 ## Команды
 
@@ -34,7 +27,6 @@ app.run(print(app.export_session_string()))
 Отправляй в любую группу — бот будет каждую минуту слать этот текст.
 - Автоматически подстраивается под slowmode
 - Останавливается если забанят/замутят
-- Реагирует на требования ботов-администраторов
 
 ### `/stopspam`
 Останавливает спам в текущем чате.
