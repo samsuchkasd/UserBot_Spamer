@@ -11,16 +11,11 @@ from pyrogram.errors import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-# ─── Telegram API credentials (public Telegram Desktop credentials) ────────────
 API_ID = 2040
 API_HASH = "b18441a1ff607e10a989891a5462e627"
 
-# ─── Load sessions from environment ───────────────────────────────────────────
+# ─── Load sessions ─────────────────────────────────────────────────────────────
 def load_sessions() -> list[str]:
-    """
-    Reads SESSION_STRING, SESSION_STRING1, SESSION_STRING2, ... from env.
-    Add as many as you want — they are all picked up automatically.
-    """
     sessions = []
     base = os.environ.get("SESSION_STRING")
     if base:
@@ -35,11 +30,15 @@ def load_sessions() -> list[str]:
             break
     return sessions
 
-# ─── Per-account state ────────────────────────────────────────────────────────
+# ─── Per-account state ─────────────────────────────────────────────────────────
 spam_tasks: dict[int, dict[int, asyncio.Task]] = {}
 first_message_seen: dict[int, set[int]] = {}
 
-# ─── Helpers ──────────────────────────────────────────────────────────────────
+# Auto-responder texts (shared across accounts, can be changed at runtime)
+auto_msg1 = "Привет"
+auto_msg2 = "Я сейчас немного занята если ты ищешь сливы то все ссылки в моем профиле в закрепленном канале 😅"
+
+# ─── Helpers ───────────────────────────────────────────────────────────────────
 def make_client(session_string: str, idx: int) -> Client:
     return Client(
         name=f"account_{idx}",
@@ -50,64 +49,98 @@ def make_client(session_string: str, idx: int) -> Client:
     )
 
 
-async def spam_loop(client: Client, chat_id: int, text: str, acc_idx: int):
-    """Continuously sends text to chat_id every minute (or slowmode interval)."""
-    interval = 60
+async def spam_loop(client: Client, chat_id: int, text: str, acc_idx: int, interval_sec: int):
+    """
+    Sends `text` to `chat_id` every `interval_sec` seconds.
+    Automatically adapts to slowmode. Stops on ban/mute.
+    """
     consecutive_errors = 0
+    current_interval = interval_sec
 
     while True:
         try:
             await client.send_message(chat_id, text)
             consecutive_errors = 0
-            logger.info(f"[acc{acc_idx}] Spam sent to {chat_id}")
+            logger.info(f"[acc{acc_idx}] Spam sent to {chat_id}, next in {current_interval}s")
+            await asyncio.sleep(current_interval)
+
         except SlowmodeWait as e:
-            interval = e.value + 2
-            logger.info(f"[acc{acc_idx}] Slowmode detected: waiting {e.value}s, adapting interval")
-            await asyncio.sleep(e.value)
-            continue
+            # Slowmode detected — wait the required time then continue
+            wait = e.value + 1
+            logger.info(f"[acc{acc_idx}] Slowmode {e.value}s in {chat_id}, waiting...")
+            await asyncio.sleep(wait)
+            # After slowmode wait, reset interval to slowmode value if it's larger
+            if wait > current_interval:
+                current_interval = wait
+
         except (UserBanned, ChatWriteForbidden, ChatAdminRequired) as e:
             logger.warning(f"[acc{acc_idx}] Spam stopped in {chat_id}: {e}")
             spam_tasks[acc_idx].pop(chat_id, None)
             return
+
         except FloodWait as e:
             logger.warning(f"[acc{acc_idx}] FloodWait {e.value}s")
             await asyncio.sleep(e.value)
-            continue
+
+        except asyncio.CancelledError:
+            return
+
         except Exception as e:
             consecutive_errors += 1
-            logger.error(f"[acc{acc_idx}] Unexpected error in spam_loop: {e}")
+            logger.error(f"[acc{acc_idx}] Error in spam_loop: {e}")
             if consecutive_errors >= 5:
                 spam_tasks[acc_idx].pop(chat_id, None)
                 return
-
-        await asyncio.sleep(interval)
+            await asyncio.sleep(5)
 
 
 def build_handlers(client: Client, acc_idx: int):
-    """Register all event handlers on the given client."""
+    global auto_msg1, auto_msg2
 
-    # ── /spam <text> ──────────────────────────────────────────────────────────
+    # ── /spam [Nс] <текст> ──────────────────────────────────────────────────
+    # Usage examples:
+    #   /spam привет всем         → каждую минуту (по умолчанию)
+    #   /spam 3с привет всем      → каждые 3 минуты
     @client.on_message(filters.command("spam", prefixes="/") & filters.me)
     async def cmd_spam(c: Client, msg: Message):
-        parts = msg.text.split(maxsplit=1)
-        if len(parts) < 2:
-            await msg.reply("Использование: /spam текст который нужно спамить")
+        args = msg.text.split(maxsplit=1)
+        if len(args) < 2:
+            await msg.reply(
+                "Использование:\n"
+                "  /spam текст — каждую минуту\n"
+                "  /spam 5с текст — каждые 5 минут\n"
+                "\n1с = 1 минута. Slowmode подстраивается автоматически."
+            )
             return
 
-        spam_text = parts[1]
+        rest = args[1]
+        interval_min = 1  # default: 1 minute
+
+        # Check if first word is a time specifier like "5с" or "10с"
+        parts = rest.split(maxsplit=1)
+        if parts[0].endswith("с") and parts[0][:-1].isdigit():
+            interval_min = int(parts[0][:-1])
+            if len(parts) < 2:
+                await msg.reply("Укажи текст после времени: /spam 3с твой текст")
+                return
+            spam_text = parts[1]
+        else:
+            spam_text = rest
+
+        interval_sec = interval_min * 60
         chat_id = msg.chat.id
 
-        # Cancel previous spam task in this chat if running
+        # Cancel previous spam task in this chat
         old_task = spam_tasks[acc_idx].get(chat_id)
         if old_task and not old_task.done():
             old_task.cancel()
 
-        task = asyncio.create_task(spam_loop(c, chat_id, spam_text, acc_idx))
+        task = asyncio.create_task(spam_loop(c, chat_id, spam_text, acc_idx, interval_sec))
         spam_tasks[acc_idx][chat_id] = task
         await msg.delete()
-        logger.info(f"[acc{acc_idx}] Spam started in {chat_id}: {spam_text[:30]}...")
+        logger.info(f"[acc{acc_idx}] Spam started in {chat_id} every {interval_min}м: {spam_text[:30]}")
 
-    # ── /stopspam ─────────────────────────────────────────────────────────────
+    # ── /stopspam ───────────────────────────────────────────────────────────
     @client.on_message(filters.command("stopspam", prefixes="/") & filters.me)
     async def cmd_stopspam(c: Client, msg: Message):
         chat_id = msg.chat.id
@@ -118,7 +151,40 @@ def build_handlers(client: Client, acc_idx: int):
         else:
             await msg.reply("Нет активного спама в этом чате.")
 
-    # ── Private message auto-responder ────────────────────────────────────────
+    # ── /setmsg1 <текст> ─────────────────────────────────────────────────────
+    # Changes the 1st auto-reply message (globally for all accounts)
+    @client.on_message(filters.command("setmsg1", prefixes="/") & filters.me)
+    async def cmd_setmsg1(c: Client, msg: Message):
+        global auto_msg1
+        parts = msg.text.split(maxsplit=1)
+        if len(parts) < 2:
+            await msg.reply(f"Текущее 1-е сообщение:\n{auto_msg1}\n\nУкажи новый текст: /setmsg1 новый текст")
+            return
+        auto_msg1 = parts[1]
+        await msg.reply(f"✅ 1-е сообщение обновлено:\n{auto_msg1}")
+
+    # ── /setmsg2 <текст> ─────────────────────────────────────────────────────
+    # Changes the 2nd auto-reply message (globally for all accounts)
+    @client.on_message(filters.command("setmsg2", prefixes="/") & filters.me)
+    async def cmd_setmsg2(c: Client, msg: Message):
+        global auto_msg2
+        parts = msg.text.split(maxsplit=1)
+        if len(parts) < 2:
+            await msg.reply(f"Текущее 2-е сообщение:\n{auto_msg2}\n\nУкажи новый текст: /setmsg2 новый текст")
+            return
+        auto_msg2 = parts[1]
+        await msg.reply(f"✅ 2-е сообщение обновлено:\n{auto_msg2}")
+
+    # ── /msgs — показать текущие тексты автоответчика ────────────────────────
+    @client.on_message(filters.command("msgs", prefixes="/") & filters.me)
+    async def cmd_msgs(c: Client, msg: Message):
+        await msg.reply(
+            f"📨 **Автоответчик:**\n\n"
+            f"**1-е сообщение:**\n{auto_msg1}\n\n"
+            f"**2-е сообщение:**\n{auto_msg2}"
+        )
+
+    # ── Private message auto-responder ───────────────────────────────────────
     @client.on_message(filters.private & ~filters.me & ~filters.bot)
     async def auto_reply(c: Client, msg: Message):
         user_id = msg.from_user.id if msg.from_user else None
@@ -127,18 +193,16 @@ def build_handlers(client: Client, acc_idx: int):
 
         seen = first_message_seen[acc_idx]
 
-        # ── Flood detection: 5+ identical messages or stickers → block ────────
+        # ── Flood detection ────────────────────────────────────────────────
         try:
             messages = [m async for m in c.get_chat_history(user_id, limit=5)]
 
-            # 5 stickers in a row
             if len(messages) >= 5 and all(getattr(m, "sticker", None) for m in messages[:5]):
                 await c.block_user(user_id)
                 await c.delete_chat_history(user_id)
                 logger.info(f"[acc{acc_idx}] Blocked {user_id} — sticker flood")
                 return
 
-            # 5 identical text messages in a row
             texts = [m.text for m in messages[:5] if m.text]
             if len(texts) >= 5 and len(set(texts)) == 1:
                 await c.block_user(user_id)
@@ -148,18 +212,14 @@ def build_handlers(client: Client, acc_idx: int):
         except Exception as e:
             logger.warning(f"[acc{acc_idx}] History check error for {user_id}: {e}")
 
-        # ── First-time contact → send auto-reply sequence ─────────────────────
+        # ── First-time message → auto-reply ───────────────────────────────
         if user_id not in seen:
             seen.add(user_id)
             try:
-                await c.send_message(user_id, "Привет")
+                await c.send_message(user_id, auto_msg1)
                 await c.send_chat_action(user_id, "typing")
                 await asyncio.sleep(5)
-                await c.send_message(
-                    user_id,
-                    "Я сейчас немного занята если ты ищешь сливы то все ссылки в моем профиле в закрепленном канале 😅"
-                )
-                # Mute forever (unix timestamp max = muted forever)
+                await c.send_message(user_id, auto_msg2)
                 await c.update_chat_notification_settings(
                     user_id,
                     mute_until=2147483647
@@ -177,7 +237,7 @@ async def main():
     if not sessions:
         logger.error(
             "Не найдено ни одной сессии! "
-            "Добавь SESSION_STRING (и SESSION_STRING1, SESSION_STRING2, ...) в переменные окружения."
+            "Добавь SESSION_STRING (и SESSION_STRING1, SESSION_STRING2, ...) в переменные Railway."
         )
         return
 
@@ -197,7 +257,6 @@ async def main():
         logger.info(f"✅ Аккаунт подключён: {me.first_name} (@{me.username})")
 
     logger.info("Все аккаунты запущены. Работаю...")
-    # Keep running forever
     await asyncio.gather(*[asyncio.Event().wait() for _ in clients])
 
 
