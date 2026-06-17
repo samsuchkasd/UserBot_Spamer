@@ -16,17 +16,13 @@ from pyrogram.errors import (
     ChatAdminInviteRequired, ChatForwardsRestricted
 )
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 API_ID   = 2040
 API_HASH = "b18441a1ff607e10a989891a5462e627"
 FLOOD_THRESHOLD = 5
 
-# ─── Sessions ────────────────────────────────────────────────────────────────────
 def load_sessions() -> list[str]:
     sessions = []
     if s := os.environ.get("SESSION_STRING"):
@@ -36,7 +32,6 @@ def load_sessions() -> list[str]:
         sessions.append(s); i += 1
     return sessions
 
-# ─── Global state ────────────────────────────────────────────────────────────────
 spam_tasks:         dict[int, dict[int, asyncio.Task]] = {}
 first_message_seen: dict[int, set[int]]               = {}
 user_recent:        dict[int, dict[int, list[str]]]   = {}
@@ -73,7 +68,6 @@ MEDIA_TYPES = {
     enums.MessageMediaType.VIDEO_NOTE, enums.MessageMediaType.STICKER,
 }
 
-# ─── Helpers ─────────────────────────────────────────────────────────────────────
 async def notify_me(client: Client, text: str):
     try:
         await client.send_message("me", text)
@@ -104,24 +98,25 @@ async def safe_mute_and_archive(client: Client, user_id: int, acc_idx: int):
     except Exception as e:
         logger.debug(f"[acc{acc_idx}] archive {user_id}: {e}")
 
-# ─── Download one file, return local path or None ────────────────────────────────
+# ─── Download single file → local path or None ───────────────────────────────────
 async def download_one(client: Client, msg: Message) -> str | None:
+    """file_name="/tmp/" → Pyrogram дописывает правильное расширение (.jpg/.mp4/etc.)"""
     for attempt in range(3):
         try:
             path = await asyncio.wait_for(
                 client.download_media(msg, file_name="/tmp/"),
-                timeout=120
+                timeout=180
             )
             if path and os.path.exists(path):
                 return path
         except asyncio.TimeoutError:
             logger.warning(f"download timeout msg {msg.id} attempt {attempt+1}")
-            await asyncio.sleep(2)
+            await asyncio.sleep(5)
         except FloodWait as e:
-            await asyncio.sleep(e.value + 1)
+            await asyncio.sleep(e.value + 2)
         except Exception as e:
             logger.warning(f"download_one {msg.id} attempt {attempt+1}: {e}")
-            await asyncio.sleep(1)
+            await asyncio.sleep(3)
     return None
 
 def cleanup(*paths):
@@ -130,145 +125,99 @@ def cleanup(*paths):
             try: os.remove(p)
             except Exception: pass
 
-# ─── Send one file without caption ───────────────────────────────────────────────
 async def send_one_file(client: Client, msg: Message, path: str, dst: int) -> bool:
     try:
-        if msg.photo:
-            await client.send_photo(dst, path, caption="")
-        elif msg.video:
-            await client.send_video(dst, path, caption="",
-                duration=msg.video.duration, width=msg.video.width, height=msg.video.height)
-        elif msg.animation:
-            await client.send_animation(dst, path, caption="")
-        elif msg.document:
-            await client.send_document(dst, path, caption="")
-        elif msg.audio:
-            await client.send_audio(dst, path, caption="", duration=msg.audio.duration)
-        elif msg.voice:
-            await client.send_voice(dst, path, duration=msg.voice.duration)
-        elif msg.video_note:
-            await client.send_video_note(dst, path, duration=msg.video_note.duration)
-        elif msg.sticker:
-            await client.send_sticker(dst, path)
-        else:
-            return False
+        if msg.photo:           await client.send_photo(dst, path, caption="")
+        elif msg.video:         await client.send_video(dst, path, caption="",
+                                    duration=msg.video.duration,
+                                    width=msg.video.width, height=msg.video.height)
+        elif msg.animation:     await client.send_animation(dst, path, caption="")
+        elif msg.document:      await client.send_document(dst, path, caption="")
+        elif msg.audio:         await client.send_audio(dst, path, caption="",
+                                    duration=msg.audio.duration)
+        elif msg.voice:         await client.send_voice(dst, path, duration=msg.voice.duration)
+        elif msg.video_note:    await client.send_video_note(dst, path, duration=msg.video_note.duration)
+        elif msg.sticker:       await client.send_sticker(dst, path)
+        else:                   return False
         return True
     except FloodWait as e:
-        await asyncio.sleep(e.value + 1)
-        return False
+        await asyncio.sleep(e.value + 2); return False
     except Exception as e:
-        logger.warning(f"send_one_file {msg.id}: {e}")
-        return False
+        logger.warning(f"send_one_file {msg.id}: {e}"); return False
 
-# ─── Single message: copy (no caption) → download+send fallback ──────────────────
 async def transfer_single(client: Client, src: int, msg: Message, dst: int) -> bool:
-    # 1. Попробуем copy_message без подписи
     try:
-        await client.copy_message(chat_id=dst, from_chat_id=src,
-                                  message_id=msg.id, caption="")
+        await client.copy_message(chat_id=dst, from_chat_id=src, message_id=msg.id, caption="")
         return True
     except ChatForwardsRestricted:
         pass
     except FloodWait as e:
-        await asyncio.sleep(e.value + 1)
-        return False
+        await asyncio.sleep(e.value + 2); return False
     except Exception:
         pass
-
-    # 2. Fallback: скачать и отправить без подписи
     path = await download_one(client, msg)
-    if not path:
-        return False
-    try:
-        return await send_one_file(client, msg, path, dst)
-    finally:
-        cleanup(path)
+    if not path: return False
+    try:    return await send_one_file(client, msg, path, dst)
+    finally: cleanup(path)
 
-# ─── Album: download each file → send_media_group (no captions) ──────────────────
 async def transfer_album(client: Client, src: int, msgs: list[Message], dst: int) -> tuple[int, int]:
-    if not msgs:
-        return 0, 0
-
-    # Сортируем по ID (старые → новые = правильный порядок альбома)
+    if not msgs: return 0, 0
     msgs = sorted(msgs, key=lambda m: m.id)
 
-    # 1. Скачиваем каждый файл по одному (не пропускаем — пробуем 3 раза)
     downloaded: list[tuple[Message, str]] = []
-    skip_count = 0
     for msg in msgs:
         path = await download_one(client, msg)
         if path:
             downloaded.append((msg, path))
         else:
-            logger.warning(f"album: skip msg {msg.id} — не удалось скачать")
-            skip_count += 1
+            logger.warning(f"album: skip msg {msg.id}")
+        await asyncio.sleep(0.5)
 
-    if not downloaded:
-        return 0, len(msgs)
+    if not downloaded: return 0, len(msgs)
 
-    # 2. Если только 1 файл — отправляем как одиночное
     if len(downloaded) == 1:
         msg, path = downloaded[0]
-        try:
-            ok = await send_one_file(client, msg, path, dst)
-            return (1 if ok else 0), len(msgs) - (1 if ok else 0)
-        finally:
-            cleanup(path)
+        try:    ok = await send_one_file(client, msg, path, dst); return (1 if ok else 0), len(msgs) - (1 if ok else 0)
+        finally: cleanup(path)
 
-    # 3. Строим InputMedia без подписей
-    media_list = []
-    paths_to_clean = []
+    media_list, paths_to_clean = [], []
     for msg, path in downloaded:
         paths_to_clean.append(path)
-        if msg.photo:
-            media_list.append(InputMediaPhoto(path))
-        elif msg.video:
-            media_list.append(InputMediaVideo(path))
-        elif msg.animation:
-            media_list.append(InputMediaAnimation(path))
-        elif msg.audio:
-            media_list.append(InputMediaAudio(path))
-        else:
-            media_list.append(InputMediaDocument(path))
+        if msg.photo:       media_list.append(InputMediaPhoto(path))
+        elif msg.video:     media_list.append(InputMediaVideo(path))
+        elif msg.animation: media_list.append(InputMediaAnimation(path))
+        elif msg.audio:     media_list.append(InputMediaAudio(path))
+        else:               media_list.append(InputMediaDocument(path))
 
-    # send_media_group принимает максимум 10 элементов
     sent_total = 0
     try:
-        for chunk_start in range(0, len(media_list), 10):
-            chunk = media_list[chunk_start:chunk_start + 10]
+        for i in range(0, len(media_list), 10):
+            chunk = media_list[i:i+10]
+            chunk_msgs = downloaded[i:i+len(chunk)]
             for attempt in range(3):
                 try:
                     await client.send_media_group(dst, chunk)
-                    sent_total += len(chunk)
-                    break
+                    sent_total += len(chunk); break
                 except FloodWait as e:
-                    await asyncio.sleep(e.value + 1)
+                    await asyncio.sleep(e.value + 2)
                 except Exception as e:
                     logger.warning(f"send_media_group attempt {attempt+1}: {e}")
                     if attempt == 2:
-                        # Последний шанс — шлём по одному
-                        for i, (msg_obj, _) in enumerate(
-                            downloaded[chunk_start:chunk_start + len(chunk)]
-                        ):
-                            ok = await send_one_file(client, msg_obj,
-                                                     paths_to_clean[chunk_start + i], dst)
-                            if ok:
-                                sent_total += 1
-                    await asyncio.sleep(2)
+                        for j, (m_obj, _) in enumerate(chunk_msgs):
+                            ok = await send_one_file(client, m_obj, paths_to_clean[i+j], dst)
+                            if ok: sent_total += 1
+                    await asyncio.sleep(3)
     finally:
         cleanup(*paths_to_clean)
+    return sent_total, len(msgs) - sent_total
 
-    failed_total = len(msgs) - sent_total
-    return sent_total, failed_total
-
-# ─── Channel media downloader ────────────────────────────────────────────────────
+# ─── Channel downloader with auto-resume on disconnect ───────────────────────────
 async def download_channel_media(client: Client, channel: str, acc_idx: int):
     try:
         chat = await client.get_chat(channel)
         chat_title = getattr(chat, "title", str(channel))
         chat_id = chat.id
-    except (UsernameInvalid, UsernameNotOccupied, ChannelInvalid,
-            PeerIdInvalid, ValueError, KeyError) as e:
+    except (UsernameInvalid, UsernameNotOccupied, ChannelInvalid, PeerIdInvalid, ValueError, KeyError) as e:
         await notify_me(client, f"❌ Канал не найден: {channel}\n{e}"); return
     except ChatAdminInviteRequired:
         await notify_me(client, f"❌ Нет доступа: {channel}"); return
@@ -279,69 +228,81 @@ async def download_channel_media(client: Client, channel: str, acc_idx: int):
     await notify_me(client,
         f"📥 Качаю медиа из «{chat_title}»\n"
         f"Без подписей. Альбомы целиком.\n"
+        f"При обрыве — автоматически продолжу.\n"
         f"Остановить: /stopmedia")
 
     total = 0
     failed = 0
+    resume_offset = 0  # 0 = с самого нового; потом = msg.id последнего обработанного
 
-    # Буфер текущего альбома
-    cur_gid: int | None = None
-    cur_album: list[Message] = []
-
-    async def flush():
-        nonlocal total, failed, cur_gid, cur_album
-        if cur_album:
-            ok, err = await transfer_album(client, chat_id, cur_album, me_id)
-            total += ok; failed += err
-            if ok > 0 and total % 20 == 0:
-                await notify_me(client, f"📥 «{chat_title}»: {total} файлов…")
-        cur_gid = None
-        cur_album = []
-
-    try:
-        async for msg in client.get_chat_history(chat_id):
-            if not msg.media or msg.media not in MEDIA_TYPES:
-                await flush()
+    for retry in range(30):
+        if retry > 0:
+            wait = min(30 * retry, 300)
+            await notify_me(client,
+                f"⚠️ Обрыв #{retry}, жду {wait}с…\n"
+                f"Продолжу с позиции {total} файлов.")
+            await asyncio.sleep(wait)
+            try:
+                await client.get_me()  # проверяем что соединение живо
+            except Exception:
                 continue
 
-            gid = getattr(msg, "media_group_id", None)
+        cur_gid: int | None = None
+        cur_album: list[Message] = []
+        last_id = resume_offset
 
-            if gid:
-                if gid == cur_gid:
-                    cur_album.append(msg)
+        async def flush_album():
+            nonlocal total, failed, cur_gid, cur_album
+            if cur_album:
+                ok, err = await transfer_album(client, chat_id, cur_album, me_id)
+                total += ok; failed += err
+                if total > 0 and total % 20 == 0:
+                    await notify_me(client, f"📥 «{chat_title}»: {total} файлов…")
+            cur_gid = None; cur_album = []
+
+        try:
+            async for msg in client.get_chat_history(chat_id, offset_id=resume_offset):
+                last_id = msg.id
+
+                if not msg.media or msg.media not in MEDIA_TYPES:
+                    await flush_album(); continue
+
+                gid = getattr(msg, "media_group_id", None)
+                if gid:
+                    if gid == cur_gid: cur_album.append(msg)
+                    else:
+                        await flush_album()
+                        cur_gid = gid; cur_album = [msg]
+                    continue
                 else:
-                    await flush()
-                    cur_gid = gid
-                    cur_album = [msg]
-                continue
-            else:
-                await flush()
-                ok = await transfer_single(client, chat_id, msg, me_id)
-                if ok:
-                    total += 1
-                    if total % 20 == 0:
-                        await notify_me(client, f"📥 «{chat_title}»: {total} файлов…")
-                else:
-                    failed += 1
+                    await flush_album()
+                    ok = await transfer_single(client, chat_id, msg, me_id)
+                    if ok:
+                        total += 1
+                        if total % 20 == 0:
+                            await notify_me(client, f"📥 «{chat_title}»: {total} файлов…")
+                    else:
+                        failed += 1
 
-            await asyncio.sleep(0.1)
+                await asyncio.sleep(0.8)  # 0.8с между файлами — не перегружаем DC
 
-        await flush()  # последний альбом
+            await flush_album()
+            break  # завершили без ошибок
 
-    except asyncio.CancelledError:
-        await flush()
-        await notify_me(client,
-            f"⛔️ Остановлено.\nСкопировано: {total} | Ошибок: {failed}")
-        return
-    except Exception as e:
-        await notify_me(client, f"❌ Ошибка:\n{e}\nСкопировано: {total}")
-        return
-    finally:
-        media_tasks[acc_idx] = None
+        except asyncio.CancelledError:
+            await flush_album()
+            await notify_me(client, f"⛔️ Остановлено.\nСкопировано: {total} | Ошибок: {failed}")
+            media_tasks[acc_idx] = None; return
+        except Exception as e:
+            logger.error(f"[acc{acc_idx}] download loop error: {type(e).__name__}: {e}")
+            resume_offset = last_id  # продолжим со следующего за последним обработанным
+            continue
+    else:
+        await notify_me(client, f"❌ Слишком много обрывов, остановил.\nСкопировано: {total} | Ошибок: {failed}")
+        media_tasks[acc_idx] = None; return
 
-    await notify_me(client,
-        f"✅ Готово! «{chat_title}»\n"
-        f"📁 Файлов: {total} | ❌ Ошибок: {failed}")
+    media_tasks[acc_idx] = None
+    await notify_me(client, f"✅ Готово! «{chat_title}»\n📁 Файлов: {total} | ❌ Ошибок: {failed}")
 
 # ─── Spam loop ───────────────────────────────────────────────────────────────────
 async def spam_loop(client, chat_id, chat_title, text, acc_idx, interval_sec):
@@ -349,24 +310,21 @@ async def spam_loop(client, chat_id, chat_title, text, acc_idx, interval_sec):
         f"▶️ Спам запущен\n📍 {chat_title}\n"
         f"⏱ Каждые {interval_sec//60} мин.\n"
         f"💬 {text[:100]}{'…' if len(text)>100 else ''}")
-    consecutive_errors = 0
-    current_interval = interval_sec
-    stop_reason = None
+    consecutive_errors = 0; current_interval = interval_sec; stop_reason = None
     try:
         while True:
             try:
                 await client.send_message(chat_id, text)
-                consecutive_errors = 0
-                await asyncio.sleep(current_interval)
+                consecutive_errors = 0; await asyncio.sleep(current_interval)
             except SlowmodeWait as e:
                 wait = e.value + 1
                 if wait > current_interval: current_interval = wait
                 await asyncio.sleep(wait)
             except UserBannedInChannel: stop_reason = "🚫 Аккаунт забанен"; break
-            except ChatWriteForbidden: stop_reason = "🔇 Нет прав"; break
-            except ChatAdminRequired: stop_reason = "👮 Нужны права админа"; break
-            except UserDeactivated: stop_reason = "💀 Аккаунт деактивирован"; break
-            except FloodWait as e: await asyncio.sleep(e.value)
+            except ChatWriteForbidden:  stop_reason = "🔇 Нет прав"; break
+            except ChatAdminRequired:   stop_reason = "👮 Нужны права админа"; break
+            except UserDeactivated:     stop_reason = "💀 Аккаунт деактивирован"; break
+            except FloodWait as e:      await asyncio.sleep(e.value)
             except asyncio.CancelledError: stop_reason = "⛔️ /stopspam"; raise
             except RPCError as e:
                 consecutive_errors += 1
@@ -376,12 +334,10 @@ async def spam_loop(client, chat_id, chat_title, text, acc_idx, interval_sec):
                 consecutive_errors += 1
                 if consecutive_errors >= 5: stop_reason = f"❌ {e}"; break
                 await asyncio.sleep(10)
-    except asyncio.CancelledError:
-        pass
+    except asyncio.CancelledError: pass
     finally:
         spam_tasks[acc_idx].pop(chat_id, None)
-        await notify_me(client,
-            f"⏹ Спам остановлен\n📍 {chat_title}\n{stop_reason or '⛔️ /stopspam'}")
+        await notify_me(client, f"⏹ Спам остановлен\n📍 {chat_title}\n{stop_reason or '⛔️ /stopspam'}")
 
 # ─── Handlers ────────────────────────────────────────────────────────────────────
 def build_handlers(client: Client, acc_idx: int):
@@ -395,16 +351,14 @@ def build_handlers(client: Client, acc_idx: int):
     @client.on_message(filters.command("spam", prefixes="/") & mine)
     async def cmd_spam(c, msg):
         args = msg.text.split(maxsplit=1)
-        if len(args) < 2:
-            await msg.reply("Использование:\n  /spam текст\n  /spam 5с текст"); return
+        if len(args) < 2: await msg.reply("Использование:\n  /spam текст\n  /spam 5с текст"); return
         rest = args[1]; interval_min = 1
         parts = rest.split(maxsplit=1)
         if parts[0].endswith("с") and parts[0][:-1].isdigit():
             interval_min = int(parts[0][:-1])
             if len(parts) < 2: await msg.reply("Укажи текст: /spam 3с текст"); return
             spam_text = parts[1]
-        else:
-            spam_text = rest
+        else: spam_text = rest
         chat_id = msg.chat.id
         chat_title = getattr(msg.chat, "title", None) or getattr(msg.chat, "first_name", None) or str(chat_id)
         old = spam_tasks[acc_idx].get(chat_id)
@@ -425,13 +379,11 @@ def build_handlers(client: Client, acc_idx: int):
     @client.on_message(filters.command("getmedia", prefixes="/") & mine)
     async def cmd_getmedia(c, msg):
         parts = msg.text.split(maxsplit=1)
-        if len(parts) < 2:
-            await msg.reply("Использование:\n  /getmedia @channel\n  /getmedia https://t.me/channel"); return
+        if len(parts) < 2: await msg.reply("Использование:\n  /getmedia @channel\n  /getmedia https://t.me/channel"); return
         channel = parse_channel(parts[1].strip())
         if not channel: await msg.reply("❌ Не могу распознать ссылку."); return
         existing = media_tasks.get(acc_idx)
-        if existing and not existing.done():
-            await msg.reply("⚠️ Уже идёт скачивание. Останови: /stopmedia"); return
+        if existing and not existing.done(): await msg.reply("⚠️ Уже идёт. Останови: /stopmedia"); return
         media_tasks[acc_idx] = asyncio.create_task(download_channel_media(c, channel, acc_idx))
         try: await msg.delete()
         except Exception: pass
@@ -440,10 +392,8 @@ def build_handlers(client: Client, acc_idx: int):
     async def cmd_stopmedia(c, msg):
         task = media_tasks.get(acc_idx)
         if task and not task.done():
-            task.cancel()
-            await msg.reply("⛔️ Скачивание остановлено.")
-        else:
-            await msg.reply("Нет активного скачивания.")
+            task.cancel(); await msg.reply("⛔️ Скачивание остановлено.")
+        else: await msg.reply("Нет активного скачивания.")
         try: await msg.delete()
         except Exception: pass
 
@@ -466,9 +416,7 @@ def build_handlers(client: Client, acc_idx: int):
         m1 = auto_msg1 or "_(не задано)_"; m2 = auto_msg2 or "_(не задано)_"
         await msg.reply(f"📨 **Автоответчик:**\n\n**1-е:**\n{m1}\n\n**2-е:**\n{m2}")
 
-    @client.on_message(
-        filters.private & filters.incoming & ~filters.me & ~filters.bot & ~filters.service
-    )
+    @client.on_message(filters.private & filters.incoming & ~filters.me & ~filters.bot & ~filters.service)
     async def auto_reply(c, msg):
         try:
             if not msg.from_user: return
@@ -481,8 +429,7 @@ def build_handlers(client: Client, acc_idx: int):
             history.append(fp)
             if len(history) > FLOOD_THRESHOLD: history.pop(0)
             if len(history) >= FLOOD_THRESHOLD and len(set(history)) == 1:
-                await safe_block_and_delete(c, user_id, acc_idx)
-                recent.pop(user_id, None); return
+                await safe_block_and_delete(c, user_id, acc_idx); recent.pop(user_id, None); return
             seen = first_message_seen[acc_idx]
             if user_id not in seen and auto_msg1 is not None and auto_msg2 is not None:
                 seen.add(user_id)
@@ -491,8 +438,8 @@ def build_handlers(client: Client, acc_idx: int):
                     await c.send_chat_action(user_id, "typing")
                     await asyncio.sleep(5)
                     await c.send_message(user_id, auto_msg2)
-                except (UserIsBlocked, PeerFlood, PeerIdInvalid,
-                        InputUserDeactivated, UserDeactivated, ValueError, KeyError) as e:
+                except (UserIsBlocked, PeerFlood, PeerIdInvalid, InputUserDeactivated,
+                        UserDeactivated, ValueError, KeyError) as e:
                     logger.debug(f"[acc{acc_idx}] auto-reply skip {user_id}: {e}"); return
                 except Exception as e:
                     logger.warning(f"[acc{acc_idx}] auto-reply {user_id}: {e}"); return
@@ -503,8 +450,7 @@ def build_handlers(client: Client, acc_idx: int):
 # ─── Main ────────────────────────────────────────────────────────────────────────
 async def main():
     sessions = load_sessions()
-    if not sessions:
-        logger.error("SESSION_STRING не найден!"); return
+    if not sessions: logger.error("SESSION_STRING не найден!"); return
     logger.info(f"Запускаю {len(sessions)} аккаунт(ов)...")
     clients = []
     for idx, session_string in enumerate(sessions):
