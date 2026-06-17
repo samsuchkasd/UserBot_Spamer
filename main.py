@@ -17,11 +17,11 @@ from pyrogram.errors import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-API_ID  = 2040
+API_ID   = 2040
 API_HASH = "b18441a1ff607e10a989891a5462e627"
 FLOOD_THRESHOLD = 5
 
-# ─── Sessions ──────────────────────────────────────────────────────────────────
+# ─── Sessions ───────────────────────────────────────────────────────────────────
 def load_sessions() -> list[str]:
     sessions = []
     if s := os.environ.get("SESSION_STRING"):
@@ -32,7 +32,7 @@ def load_sessions() -> list[str]:
         i += 1
     return sessions
 
-# ─── State ─────────────────────────────────────────────────────────────────────
+# ─── State ──────────────────────────────────────────────────────────────────────
 spam_tasks:         dict[int, dict[int, asyncio.Task]] = {}
 first_message_seen: dict[int, set[int]]               = {}
 user_recent:        dict[int, dict[int, list[str]]]   = {}
@@ -58,7 +58,7 @@ def parse_channel(text: str) -> str | None:
         return text
     return None
 
-# ─── Client factory ────────────────────────────────────────────────────────────
+# ─── Client factory ─────────────────────────────────────────────────────────────
 def make_client(session_string: str, idx: int) -> Client:
     return Client(
         name=f"account_{idx}",
@@ -68,7 +68,7 @@ def make_client(session_string: str, idx: int) -> Client:
         in_memory=True,
     )
 
-# ─── Safe helpers ───────────────────────────────────────────────────────────────
+# ─── Safe helpers ────────────────────────────────────────────────────────────────
 async def notify_me(client: Client, text: str):
     try:
         await client.send_message("me", text)
@@ -83,7 +83,6 @@ async def safe_block_and_delete(client: Client, user_id: int, acc_idx: int):
             logger.debug(f"[acc{acc_idx}] {fn.__name__} {user_id}: {e}")
 
 async def safe_mute_and_archive(client: Client, user_id: int, acc_idx: int):
-    # All peer operations wrapped individually — one failing must not break the other
     try:
         from pyrogram.raw import functions, types as raw_types
         peer = await client.resolve_peer(user_id)
@@ -96,86 +95,15 @@ async def safe_mute_and_archive(client: Client, user_id: int, acc_idx: int):
             )
         )
     except (PeerIdInvalid, ValueError, KeyError, TypeError) as e:
-        logger.debug(f"[acc{acc_idx}] mute peer resolve {user_id}: {e}")
+        logger.debug(f"[acc{acc_idx}] mute resolve {user_id}: {e}")
     except Exception as e:
         logger.debug(f"[acc{acc_idx}] mute {user_id}: {e}")
-
     try:
         await client.archive_chats([user_id])
     except Exception as e:
         logger.debug(f"[acc{acc_idx}] archive {user_id}: {e}")
 
-# ─── Media: copy with fallback to download+reupload ────────────────────────────
-async def copy_or_reupload(client: Client, src_chat_id: int, msg: Message, dst_chat_id: int) -> bool:
-    """
-    Try copy_message first.
-    If CHAT_FORWARDS_RESTRICTED — download the file and re-upload without author.
-    Returns True on success.
-    """
-    # Attempt 1: copy_message (no forward header)
-    try:
-        await client.copy_message(
-            chat_id=dst_chat_id,
-            from_chat_id=src_chat_id,
-            message_id=msg.id,
-        )
-        return True
-    except ChatForwardsRestricted:
-        pass  # protected channel — fall through to download+reupload
-    except FloodWait as e:
-        await asyncio.sleep(e.value)
-        return False
-    except Exception as e:
-        logger.debug(f"copy_message failed: {e}")
-        return False
-
-    # Attempt 2: download + re-upload (bypasses copy protection)
-    tmp_path = None
-    try:
-        tmp_path = await client.download_media(msg, file_name=f"/tmp/tg_media_{msg.id}_")
-
-        caption = msg.caption or ""
-
-        if msg.photo:
-            await client.send_photo(dst_chat_id, tmp_path, caption=caption)
-        elif msg.video:
-            await client.send_video(dst_chat_id, tmp_path, caption=caption,
-                                    duration=msg.video.duration,
-                                    width=msg.video.width,
-                                    height=msg.video.height)
-        elif msg.document:
-            await client.send_document(dst_chat_id, tmp_path, caption=caption)
-        elif msg.audio:
-            await client.send_audio(dst_chat_id, tmp_path, caption=caption,
-                                    duration=msg.audio.duration)
-        elif msg.voice:
-            await client.send_voice(dst_chat_id, tmp_path, duration=msg.voice.duration)
-        elif msg.video_note:
-            await client.send_video_note(dst_chat_id, tmp_path,
-                                         duration=msg.video_note.duration)
-        elif msg.animation:
-            await client.send_animation(dst_chat_id, tmp_path, caption=caption)
-        elif msg.sticker:
-            await client.send_sticker(dst_chat_id, tmp_path)
-        else:
-            return False
-
-        return True
-
-    except FloodWait as e:
-        await asyncio.sleep(e.value)
-        return False
-    except Exception as e:
-        logger.warning(f"reupload failed for msg {msg.id}: {e}")
-        return False
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
-
-# ─── Media download task ────────────────────────────────────────────────────────
+# ─── Media copy with fallback ────────────────────────────────────────────────────
 MEDIA_TYPES = {
     enums.MessageMediaType.PHOTO,
     enums.MessageMediaType.VIDEO,
@@ -187,73 +115,116 @@ MEDIA_TYPES = {
     enums.MessageMediaType.STICKER,
 }
 
+async def copy_or_reupload(client: Client, src_chat_id: int, msg: Message, dst_chat_id: int) -> bool:
+    try:
+        await client.copy_message(chat_id=dst_chat_id, from_chat_id=src_chat_id, message_id=msg.id)
+        return True
+    except ChatForwardsRestricted:
+        pass
+    except FloodWait as e:
+        await asyncio.sleep(e.value)
+        return False
+    except Exception:
+        return False
+
+    # Fallback: download + re-upload (bypasses copy protection)
+    tmp_path = None
+    try:
+        tmp_path = await client.download_media(msg, file_name=f"/tmp/tg_{msg.id}_")
+        cap = msg.caption or ""
+        if msg.photo:
+            await client.send_photo(dst_chat_id, tmp_path, caption=cap)
+        elif msg.video:
+            await client.send_video(dst_chat_id, tmp_path, caption=cap,
+                                    duration=msg.video.duration,
+                                    width=msg.video.width, height=msg.video.height)
+        elif msg.document:
+            await client.send_document(dst_chat_id, tmp_path, caption=cap)
+        elif msg.audio:
+            await client.send_audio(dst_chat_id, tmp_path, caption=cap,
+                                    duration=msg.audio.duration)
+        elif msg.voice:
+            await client.send_voice(dst_chat_id, tmp_path, duration=msg.voice.duration)
+        elif msg.video_note:
+            await client.send_video_note(dst_chat_id, tmp_path, duration=msg.video_note.duration)
+        elif msg.animation:
+            await client.send_animation(dst_chat_id, tmp_path, caption=cap)
+        elif msg.sticker:
+            await client.send_sticker(dst_chat_id, tmp_path)
+        else:
+            return False
+        return True
+    except FloodWait as e:
+        await asyncio.sleep(e.value)
+        return False
+    except Exception as e:
+        logger.warning(f"reupload failed msg {msg.id}: {e}")
+        return False
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try: os.remove(tmp_path)
+            except Exception: pass
+
+# ─── Channel media downloader ────────────────────────────────────────────────────
 async def download_channel_media(client: Client, channel: str, acc_idx: int):
     try:
         chat = await client.get_chat(channel)
         chat_title = getattr(chat, "title", str(channel))
-        chat_id    = chat.id
+        chat_id = chat.id
     except (UsernameInvalid, UsernameNotOccupied, ChannelInvalid,
             PeerIdInvalid, ValueError, KeyError) as e:
         await notify_me(client, f"❌ Канал не найден: {channel}\n{e}")
         return
     except ChatAdminInviteRequired:
-        await notify_me(client, f"❌ Нет доступа (нужно быть участником): {channel}")
+        await notify_me(client, f"❌ Нет доступа (стань участником): {channel}")
         return
     except Exception as e:
-        await notify_me(client, f"❌ Ошибка при получении канала {channel}:\n{e}")
+        await notify_me(client, f"❌ Ошибка при получении канала:\n{e}")
         return
 
     me_id = me_ids[acc_idx]
     await notify_me(client,
-        f"📥 Начинаю скачивание медиа из «{chat_title}»\n"
-        f"Отправлю сюда без указания автора.\n"
-        f"(Для остановки: /stopmedia)")
+        f"📥 Скачиваю медиа из «{chat_title}»\n"
+        f"Буду присылать сюда без автора.\n"
+        f"Остановить: /stopmedia")
 
     total = 0
     failed = 0
-
     try:
         async for msg in client.get_chat_history(chat_id):
             if not msg.media or msg.media not in MEDIA_TYPES:
                 continue
-
             ok = await copy_or_reupload(client, chat_id, msg, me_id)
             if ok:
                 total += 1
             else:
                 failed += 1
-
             if total > 0 and total % 10 == 0:
                 await notify_me(client, f"📥 «{chat_title}»: {total} файлов…")
-
             await asyncio.sleep(0.5)
-
     except asyncio.CancelledError:
-        await notify_me(client, f"⛔️ Скачивание «{chat_title}» остановлено.\nСкопировано: {total}, ошибок: {failed}")
+        await notify_me(client, f"⛔️ Остановлено.\nСкопировано: {total}, ошибок: {failed}")
         return
     except Exception as e:
-        await notify_me(client, f"❌ Ошибка во время скачивания:\n{e}\nСкопировано: {total}")
+        await notify_me(client, f"❌ Ошибка:\n{e}\nСкопировано: {total}")
         return
     finally:
         media_tasks[acc_idx] = None
 
     await notify_me(client,
         f"✅ Готово! «{chat_title}»\n"
-        f"📁 Скопировано: {total}\n"
-        f"❌ Ошибок: {failed}")
+        f"📁 Файлов: {total} | ❌ Ошибок: {failed}")
 
-# ─── Spam loop ──────────────────────────────────────────────────────────────────
+# ─── Spam loop ───────────────────────────────────────────────────────────────────
 async def spam_loop(client, chat_id, chat_title, text, acc_idx, interval_sec):
-    interval_min = interval_sec // 60
     await notify_me(client,
         f"▶️ Спам запущен\n📍 {chat_title}\n"
-        f"⏱ Каждые {interval_min} мин.\n"
+        f"⏱ Каждые {interval_sec//60} мин.\n"
         f"💬 {text[:100]}{'…' if len(text)>100 else ''}")
 
     consecutive_errors = 0
     current_interval = interval_sec
     stop_reason = None
-
     try:
         while True:
             try:
@@ -262,30 +233,27 @@ async def spam_loop(client, chat_id, chat_title, text, acc_idx, interval_sec):
                 await asyncio.sleep(current_interval)
             except SlowmodeWait as e:
                 wait = e.value + 1
-                if wait > current_interval:
-                    current_interval = wait
+                if wait > current_interval: current_interval = wait
                 await asyncio.sleep(wait)
             except UserBannedInChannel:
-                stop_reason = "🚫 Аккаунт забанен в группе/канале"; break
+                stop_reason = "🚫 Аккаунт забанен"; break
             except ChatWriteForbidden:
                 stop_reason = "🔇 Нет прав на отправку"; break
             except ChatAdminRequired:
                 stop_reason = "👮 Требуются права администратора"; break
             except UserDeactivated:
-                stop_reason = "💀 Аккаунт деактивирован Telegram"; break
+                stop_reason = "💀 Аккаунт деактивирован"; break
             except FloodWait as e:
                 await asyncio.sleep(e.value)
             except asyncio.CancelledError:
-                stop_reason = "⛔️ Остановлен командой /stopspam"; raise
+                stop_reason = "⛔️ Остановлен /stopspam"; raise
             except RPCError as e:
                 consecutive_errors += 1
-                if consecutive_errors >= 5:
-                    stop_reason = f"❌ Много ошибок: {e}"; break
+                if consecutive_errors >= 5: stop_reason = f"❌ Много ошибок: {e}"; break
                 await asyncio.sleep(10)
             except Exception as e:
                 consecutive_errors += 1
-                if consecutive_errors >= 5:
-                    stop_reason = f"❌ Неожиданная ошибка: {e}"; break
+                if consecutive_errors >= 5: stop_reason = f"❌ Неожиданная ошибка: {e}"; break
                 await asyncio.sleep(10)
     except asyncio.CancelledError:
         pass
@@ -293,13 +261,27 @@ async def spam_loop(client, chat_id, chat_title, text, acc_idx, interval_sec):
         spam_tasks[acc_idx].pop(chat_id, None)
         await notify_me(client,
             f"⏹ Спам остановлен\n📍 {chat_title}\n"
-            f"📌 {stop_reason or '⛔️ Остановлен командой /stopspam'}")
+            f"📌 {stop_reason or '⛔️ Остановлен /stopspam'}")
 
-# ─── Handlers ───────────────────────────────────────────────────────────────────
+# ─── Build handlers — вызывается ПОСЛЕ start() чтобы знать me_id ────────────────
 def build_handlers(client: Client, acc_idx: int):
     global auto_msg1, auto_msg2
 
-    @client.on_message(filters.command("spam", prefixes="/") & filters.outgoing)
+    my_id = me_ids[acc_idx]  # известен т.к. вызываем после c.start()
+
+    # Кастомный фильтр: срабатывает на ЛЮБОЕ моё сообщение
+    # (и outgoing, и входящая копия в Избранном — Pyrogram даёт оба варианта)
+    def _is_mine(_, __, msg: Message) -> bool:
+        if msg.outgoing:
+            return True
+        if msg.from_user and msg.from_user.id == my_id:
+            return True
+        return False
+
+    mine = filters.create(_is_mine)
+
+    # ── /spam [Nс] <текст> ──────────────────────────────────────────────────────
+    @client.on_message(filters.command("spam", prefixes="/") & mine)
     async def cmd_spam(c: Client, msg: Message):
         args = msg.text.split(maxsplit=1)
         if len(args) < 2:
@@ -325,18 +307,43 @@ def build_handlers(client: Client, acc_idx: int):
         try: await msg.delete()
         except Exception: pass
 
-    @client.on_message(filters.command("stopspam", prefixes="/") & filters.outgoing)
+    # ── /stopspam ────────────────────────────────────────────────────────────────
+    @client.on_message(filters.command("stopspam", prefixes="/") & mine)
     async def cmd_stopspam(c: Client, msg: Message):
         task = spam_tasks[acc_idx].get(msg.chat.id)
         if task and not task.done():
             task.cancel()
         else:
-            await msg.reply("Нет активного спама.")
-            return
+            await msg.reply("Нет активного спама."); return
         try: await msg.delete()
         except Exception: pass
 
-    @client.on_message(filters.command("stopmedia", prefixes="/") & filters.outgoing)
+    # ── /getmedia <ссылка или @username или id> ──────────────────────────────────
+    @client.on_message(filters.command("getmedia", prefixes="/") & mine)
+    async def cmd_getmedia(c: Client, msg: Message):
+        parts = msg.text.split(maxsplit=1)
+        if len(parts) < 2:
+            await msg.reply(
+                "Использование:\n"
+                "  /getmedia https://t.me/channel\n"
+                "  /getmedia @channel\n"
+                "  /getmedia -1001234567890\n\n"
+                "Медиа придёт в Избранное без указания автора."
+            )
+            return
+        channel = parse_channel(parts[1].strip())
+        if not channel:
+            await msg.reply("❌ Не могу распознать ссылку/username канала."); return
+        existing = media_tasks.get(acc_idx)
+        if existing and not existing.done():
+            await msg.reply("⚠️ Уже идёт скачивание. Останови: /stopmedia"); return
+        media_tasks[acc_idx] = asyncio.create_task(
+            download_channel_media(c, channel, acc_idx))
+        try: await msg.delete()
+        except Exception: pass
+
+    # ── /stopmedia ───────────────────────────────────────────────────────────────
+    @client.on_message(filters.command("stopmedia", prefixes="/") & mine)
     async def cmd_stopmedia(c: Client, msg: Message):
         task = media_tasks.get(acc_idx)
         if task and not task.done():
@@ -347,7 +354,8 @@ def build_handlers(client: Client, acc_idx: int):
         try: await msg.delete()
         except Exception: pass
 
-    @client.on_message(filters.command("setmsg1", prefixes="/") & filters.outgoing)
+    # ── /setmsg1 ─────────────────────────────────────────────────────────────────
+    @client.on_message(filters.command("setmsg1", prefixes="/") & mine)
     async def cmd_setmsg1(c: Client, msg: Message):
         global auto_msg1
         parts = msg.text.split(maxsplit=1)
@@ -356,7 +364,8 @@ def build_handlers(client: Client, acc_idx: int):
         auto_msg1 = parts[1]
         await msg.reply(f"✅ 1-е сообщение:\n{auto_msg1}")
 
-    @client.on_message(filters.command("setmsg2", prefixes="/") & filters.outgoing)
+    # ── /setmsg2 ─────────────────────────────────────────────────────────────────
+    @client.on_message(filters.command("setmsg2", prefixes="/") & mine)
     async def cmd_setmsg2(c: Client, msg: Message):
         global auto_msg2
         parts = msg.text.split(maxsplit=1)
@@ -365,99 +374,35 @@ def build_handlers(client: Client, acc_idx: int):
         auto_msg2 = parts[1]
         await msg.reply(f"✅ 2-е сообщение:\n{auto_msg2}")
 
-    @client.on_message(filters.command("msgs", prefixes="/") & filters.outgoing)
+    # ── /msgs ────────────────────────────────────────────────────────────────────
+    @client.on_message(filters.command("msgs", prefixes="/") & mine)
     async def cmd_msgs(c: Client, msg: Message):
         m1 = auto_msg1 or "_(не задано)_"
         m2 = auto_msg2 or "_(не задано)_"
         await msg.reply(f"📨 **Автоответчик:**\n\n**1-е:**\n{m1}\n\n**2-е:**\n{m2}")
 
-    @client.on_message(filters.command("getmedia", prefixes="/") & filters.outgoing)
-    async def cmd_getmedia(c: Client, msg: Message):
-        parts = msg.text.split(maxsplit=1)
-        if len(parts) < 2:
-            await msg.reply(
-                "Использование: /getmedia <ссылка или @юзернейм>\n\n"
-                "Примеры:\n"
-                "  /getmedia https://t.me/channelname\n"
-                "  /getmedia @channelname\n"
-                "  /getmedia -1001234567890"
-            )
-            return
-        channel = parse_channel(parts[1].strip())
-        if not channel:
-            await msg.reply("❌ Не могу распознать ссылку/username канала.")
-            return
-        existing = media_tasks.get(acc_idx)
-        if existing and not existing.done():
-            await msg.reply("⚠️ Уже идёт скачивание. Останови: /stopmedia")
-            return
-        media_tasks[acc_idx] = asyncio.create_task(
-            download_channel_media(c, channel, acc_idx))
-        try: await msg.delete()
-        except Exception: pass
-
-        # Saved Messages: detect channel link → start download
-    _media_lock = asyncio.Lock()
-
-    @client.on_message(filters.outgoing & filters.private)
-    async def saved_msg_handler(c: Client, msg: Message):
-        try:
-            if msg.chat.id != me_ids.get(acc_idx):
-                return
-            if msg.text and msg.text.startswith("/"):
-                return
-            text = msg.text or msg.caption or ""
-            channel = parse_channel(text)
-            if not channel:
-                return
-
-            # Lock prevents two simultaneous downloads from double-tap
-            if _media_lock.locked():
-                await notify_me(c, "⚠️ Уже идёт скачивание. Останови: /stopmedia")
-                return
-            existing = media_tasks.get(acc_idx)
-            if existing and not existing.done():
-                await notify_me(c, "⚠️ Уже идёт скачивание. Останови: /stopmedia")
-                return
-
-            async def _run():
-                async with _media_lock:
-                    await download_channel_media(c, channel, acc_idx)
-
-            media_tasks[acc_idx] = asyncio.create_task(_run())
-        except Exception as e:
-            logger.error(f"[acc{acc_idx}] saved_msg_handler error: {e}")
-
-    # Private DM auto-responder — only real humans
+    # ── Автоответчик в ЛС ────────────────────────────────────────────────────────
     @client.on_message(
         filters.private & filters.incoming & ~filters.me & ~filters.bot & ~filters.service
     )
     async def auto_reply(c: Client, msg: Message):
         try:
-            if not msg.from_user:
-                return
+            if not msg.from_user: return
             user_id = msg.from_user.id
-            # Strict guard: only positive real-user IDs, not bots
-            if user_id <= 0 or msg.from_user.is_bot:
-                return
+            if user_id <= 0 or user_id == my_id or msg.from_user.is_bot: return
 
-            # In-memory flood detection (no get_chat_history, no peer resolution)
             recent = user_recent[acc_idx]
-            if user_id not in recent:
-                recent[user_id] = []
+            if user_id not in recent: recent[user_id] = []
             fp = ("__sticker__" if msg.sticker
-                  else (msg.text or "").strip()
-                  or f"__media__")
+                  else (msg.text or "").strip() or "__media__")
             history = recent[user_id]
             history.append(fp)
-            if len(history) > FLOOD_THRESHOLD:
-                history.pop(0)
+            if len(history) > FLOOD_THRESHOLD: history.pop(0)
             if len(history) >= FLOOD_THRESHOLD and len(set(history)) == 1:
                 await safe_block_and_delete(c, user_id, acc_idx)
                 recent.pop(user_id, None)
                 return
 
-            # Auto-reply only if both texts are set
             seen = first_message_seen[acc_idx]
             if user_id not in seen and auto_msg1 is not None and auto_msg2 is not None:
                 seen.add(user_id)
@@ -469,16 +414,14 @@ def build_handlers(client: Client, acc_idx: int):
                 except (UserIsBlocked, PeerFlood, PeerIdInvalid,
                         InputUserDeactivated, UserDeactivated,
                         ValueError, KeyError) as e:
-                    logger.debug(f"[acc{acc_idx}] auto-reply skip {user_id}: {e}")
-                    return
+                    logger.debug(f"[acc{acc_idx}] auto-reply skip {user_id}: {e}"); return
                 except Exception as e:
-                    logger.warning(f"[acc{acc_idx}] auto-reply {user_id}: {e}")
-                    return
+                    logger.warning(f"[acc{acc_idx}] auto-reply {user_id}: {e}"); return
                 await safe_mute_and_archive(c, user_id, acc_idx)
         except Exception as e:
-            logger.error(f"[acc{acc_idx}] unhandled in auto_reply: {e}")
+            logger.error(f"[acc{acc_idx}] auto_reply crash: {e}")
 
-# ─── Main ───────────────────────────────────────────────────────────────────────
+# ─── Main ────────────────────────────────────────────────────────────────────────
 async def main():
     sessions = load_sessions()
     if not sessions:
@@ -487,20 +430,23 @@ async def main():
 
     logger.info(f"Запускаю {len(sessions)} аккаунт(ов)...")
     clients = []
+
     for idx, session_string in enumerate(sessions):
         spam_tasks[idx]         = {}
         first_message_seen[idx] = set()
         user_recent[idx]        = {}
         media_tasks[idx]        = None
-        c = make_client(session_string, idx)
-        build_handlers(c, idx)
-        clients.append(c)
 
-    for idx, c in enumerate(clients):
+        c = make_client(session_string, idx)
+        # Запускаем СНАЧАЛА, чтобы знать me_id до регистрации хендлеров
         await c.start()
         me = await c.get_me()
         me_ids[idx] = me.id
-        logger.info(f"✅ Подключён: {me.first_name} (@{me.username})")
+        logger.info(f"✅ Подключён: {me.first_name} (@{me.username}) | id={me.id}")
+
+        # Теперь регистрируем хендлеры — me_id уже известен
+        build_handlers(c, idx)
+        clients.append(c)
 
     logger.info("Все аккаунты запущены.")
     await asyncio.gather(*[asyncio.Event().wait() for _ in clients])
