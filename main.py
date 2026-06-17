@@ -371,7 +371,32 @@ def build_handlers(client: Client, acc_idx: int):
         m2 = auto_msg2 or "_(не задано)_"
         await msg.reply(f"📨 **Автоответчик:**\n\n**1-е:**\n{m1}\n\n**2-е:**\n{m2}")
 
-    # Saved Messages: detect channel link → start download
+    @client.on_message(filters.command("getmedia", prefixes="/") & filters.outgoing)
+    async def cmd_getmedia(c: Client, msg: Message):
+        parts = msg.text.split(maxsplit=1)
+        if len(parts) < 2:
+            await msg.reply(
+                "Использование: /getmedia <ссылка или @юзернейм>\n\n"
+                "Примеры:\n"
+                "  /getmedia https://t.me/channelname\n"
+                "  /getmedia @channelname\n"
+                "  /getmedia -1001234567890"
+            )
+            return
+        channel = parse_channel(parts[1].strip())
+        if not channel:
+            await msg.reply("❌ Не могу распознать ссылку/username канала.")
+            return
+        existing = media_tasks.get(acc_idx)
+        if existing and not existing.done():
+            await msg.reply("⚠️ Уже идёт скачивание. Останови: /stopmedia")
+            return
+        media_tasks[acc_idx] = asyncio.create_task(
+            download_channel_media(c, channel, acc_idx))
+        try: await msg.delete()
+        except Exception: pass
+
+        # Saved Messages: detect channel link → start download
     _media_lock = asyncio.Lock()
 
     @client.on_message(filters.outgoing & filters.private)
