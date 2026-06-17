@@ -109,7 +109,7 @@ async def download_one(client: Client, msg: Message) -> str | None:
     for attempt in range(3):
         try:
             path = await asyncio.wait_for(
-                client.download_media(msg, file_name=f"/tmp/tg_{msg.id}_"),
+                client.download_media(msg, file_name="/tmp/"),
                 timeout=120
             )
             if path and os.path.exists(path):
