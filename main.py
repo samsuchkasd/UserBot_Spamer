@@ -372,6 +372,8 @@ def build_handlers(client: Client, acc_idx: int):
         await msg.reply(f"📨 **Автоответчик:**\n\n**1-е:**\n{m1}\n\n**2-е:**\n{m2}")
 
     # Saved Messages: detect channel link → start download
+    _media_lock = asyncio.Lock()
+
     @client.on_message(filters.outgoing & filters.private)
     async def saved_msg_handler(c: Client, msg: Message):
         try:
@@ -383,12 +385,21 @@ def build_handlers(client: Client, acc_idx: int):
             channel = parse_channel(text)
             if not channel:
                 return
+
+            # Lock prevents two simultaneous downloads from double-tap
+            if _media_lock.locked():
+                await notify_me(c, "⚠️ Уже идёт скачивание. Останови: /stopmedia")
+                return
             existing = media_tasks.get(acc_idx)
             if existing and not existing.done():
                 await notify_me(c, "⚠️ Уже идёт скачивание. Останови: /stopmedia")
                 return
-            media_tasks[acc_idx] = asyncio.create_task(
-                download_channel_media(c, channel, acc_idx))
+
+            async def _run():
+                async with _media_lock:
+                    await download_channel_media(c, channel, acc_idx)
+
+            media_tasks[acc_idx] = asyncio.create_task(_run())
         except Exception as e:
             logger.error(f"[acc{acc_idx}] saved_msg_handler error: {e}")
 
