@@ -6,7 +6,8 @@ from pyrogram.types import Message
 from pyrogram.errors import (
     FloodWait, ChatWriteForbidden, SlowmodeWait,
     UserIsBlocked, PeerFlood, ChatAdminRequired,
-    UserBannedInChannel, RPCError
+    UserBannedInChannel, RPCError, PeerIdInvalid,
+    ChannelPrivate, InputUserDeactivated
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -35,7 +36,7 @@ def load_sessions() -> list[str]:
 spam_tasks: dict[int, dict[int, asyncio.Task]] = {}
 first_message_seen: dict[int, set[int]] = {}
 
-# Auto-responder texts — None means not configured yet
+# Auto-responder texts — None = not configured, auto-reply disabled
 auto_msg1: str | None = None
 auto_msg2: str | None = None
 
@@ -49,21 +50,15 @@ def make_client(session_string: str, idx: int) -> Client:
         in_memory=True,
     )
 
-# ─── Helpers ───────────────────────────────────────────────────────────────────
+# ─── Notify saved messages ─────────────────────────────────────────────────────
 async def notify_me(client: Client, text: str):
-    """Send a notification to Saved Messages (избранное)."""
     try:
         await client.send_message("me", text)
     except Exception as e:
         logger.warning(f"Could not send notification to Saved Messages: {e}")
 
-
+# ─── Spam loop ─────────────────────────────────────────────────────────────────
 async def spam_loop(client: Client, chat_id: int, chat_title: str, text: str, acc_idx: int, interval_sec: int):
-    """
-    Sends `text` to `chat_id` every `interval_sec` seconds.
-    Automatically adapts to slowmode. Stops on ban/mute.
-    Reports start and stop to Saved Messages.
-    """
     interval_min = interval_sec // 60
     await notify_me(
         client,
@@ -82,7 +77,6 @@ async def spam_loop(client: Client, chat_id: int, chat_title: str, text: str, ac
             try:
                 await client.send_message(chat_id, text)
                 consecutive_errors = 0
-                logger.info(f"[acc{acc_idx}] Spam sent to {chat_id}, next in {current_interval}s")
                 await asyncio.sleep(current_interval)
 
             except SlowmodeWait as e:
@@ -92,12 +86,12 @@ async def spam_loop(client: Client, chat_id: int, chat_title: str, text: str, ac
                     current_interval = wait
                 await asyncio.sleep(wait)
 
-            except UserBannedInChannel as e:
+            except UserBannedInChannel:
                 stop_reason = "🚫 Аккаунт забанен в канале/группе"
                 break
 
             except ChatWriteForbidden:
-                stop_reason = "🔇 Нет прав на отправку сообщений (мут или запрет)"
+                stop_reason = "🔇 Нет прав на отправку (мут или запрет)"
                 break
 
             except ChatAdminRequired:
@@ -114,15 +108,15 @@ async def spam_loop(client: Client, chat_id: int, chat_title: str, text: str, ac
 
             except RPCError as e:
                 consecutive_errors += 1
-                logger.error(f"[acc{acc_idx}] RPCError in spam_loop: {e}")
+                logger.error(f"[acc{acc_idx}] RPCError: {e}")
                 if consecutive_errors >= 5:
-                    stop_reason = f"❌ Слишком много ошибок подряд: {e}"
+                    stop_reason = f"❌ Слишком много ошибок: {e}"
                     break
                 await asyncio.sleep(5)
 
             except Exception as e:
                 consecutive_errors += 1
-                logger.error(f"[acc{acc_idx}] Unexpected error: {e}")
+                logger.error(f"[acc{acc_idx}] Error: {e}")
                 if consecutive_errors >= 5:
                     stop_reason = f"❌ Неожиданная ошибка: {e}"
                     break
@@ -139,15 +133,43 @@ async def spam_loop(client: Client, chat_id: int, chat_title: str, text: str, ac
             f"📍 Чат: {chat_title}\n"
             f"📌 Причина: {reason}"
         )
-        logger.info(f"[acc{acc_idx}] Spam stopped in {chat_id}: {reason}")
 
+# ─── Flood check helper ────────────────────────────────────────────────────────
+async def check_flood_and_block(client: Client, user_id: int, acc_idx: int) -> bool:
+    """
+    Returns True if user was blocked (flood detected), False otherwise.
+    Silently skips if peer can't be resolved.
+    """
+    try:
+        messages = [m async for m in client.get_chat_history(user_id, limit=5)]
 
+        # 5 stickers in a row
+        if len(messages) >= 5 and all(getattr(m, "sticker", None) for m in messages[:5]):
+            await client.block_user(user_id)
+            await client.delete_chat_history(user_id)
+            logger.info(f"[acc{acc_idx}] Blocked {user_id} — sticker flood")
+            return True
+
+        # 5 identical text messages in a row
+        texts = [m.text for m in messages[:5] if m.text]
+        if len(texts) >= 5 and len(set(texts)) == 1:
+            await client.block_user(user_id)
+            await client.delete_chat_history(user_id)
+            logger.info(f"[acc{acc_idx}] Blocked {user_id} — text flood")
+            return True
+
+    except (PeerIdInvalid, KeyError, ValueError, ChannelPrivate, InputUserDeactivated) as e:
+        logger.debug(f"[acc{acc_idx}] Skipping flood check for {user_id}: {e}")
+    except Exception as e:
+        logger.warning(f"[acc{acc_idx}] History check error for {user_id}: {e}")
+
+    return False
+
+# ─── Register all handlers on a client ────────────────────────────────────────
 def build_handlers(client: Client, acc_idx: int):
     global auto_msg1, auto_msg2
 
-    # ── /spam [Nс] <текст> ───────────────────────────────────────────────────
-    # /spam текст          → каждую минуту
-    # /spam 5с текст       → каждые 5 минут (1с = 1 минута)
+    # /spam [Nс] <текст>
     @client.on_message(filters.command("spam", prefixes="/") & filters.me)
     async def cmd_spam(c: Client, msg: Message):
         args = msg.text.split(maxsplit=1)
@@ -161,7 +183,7 @@ def build_handlers(client: Client, acc_idx: int):
             return
 
         rest = args[1]
-        interval_min = 1  # default
+        interval_min = 1
 
         parts = rest.split(maxsplit=1)
         if parts[0].endswith("с") and parts[0][:-1].isdigit():
@@ -188,7 +210,7 @@ def build_handlers(client: Client, acc_idx: int):
         spam_tasks[acc_idx][chat_id] = task
         await msg.delete()
 
-    # ── /stopspam ────────────────────────────────────────────────────────────
+    # /stopspam
     @client.on_message(filters.command("stopspam", prefixes="/") & filters.me)
     async def cmd_stopspam(c: Client, msg: Message):
         chat_id = msg.chat.id
@@ -199,7 +221,7 @@ def build_handlers(client: Client, acc_idx: int):
         else:
             await msg.reply("Нет активного спама в этом чате.")
 
-    # ── /setmsg1 <текст> ─────────────────────────────────────────────────────
+    # /setmsg1 <текст>
     @client.on_message(filters.command("setmsg1", prefixes="/") & filters.me)
     async def cmd_setmsg1(c: Client, msg: Message):
         global auto_msg1
@@ -211,7 +233,7 @@ def build_handlers(client: Client, acc_idx: int):
         auto_msg1 = parts[1]
         await msg.reply(f"✅ 1-е сообщение обновлено:\n{auto_msg1}")
 
-    # ── /setmsg2 <текст> ─────────────────────────────────────────────────────
+    # /setmsg2 <текст>
     @client.on_message(filters.command("setmsg2", prefixes="/") & filters.me)
     async def cmd_setmsg2(c: Client, msg: Message):
         global auto_msg2
@@ -223,7 +245,7 @@ def build_handlers(client: Client, acc_idx: int):
         auto_msg2 = parts[1]
         await msg.reply(f"✅ 2-е сообщение обновлено:\n{auto_msg2}")
 
-    # ── /msgs — показать текущие тексты ─────────────────────────────────────
+    # /msgs
     @client.on_message(filters.command("msgs", prefixes="/") & filters.me)
     async def cmd_msgs(c: Client, msg: Message):
         m1 = auto_msg1 or "_(не задано — автоответчик неактивен)_"
@@ -234,36 +256,24 @@ def build_handlers(client: Client, acc_idx: int):
             f"**2-е сообщение:**\n{m2}"
         )
 
-    # ── Private message auto-responder ───────────────────────────────────────
+    # Private message handler
     @client.on_message(filters.private & ~filters.me & ~filters.bot)
     async def auto_reply(c: Client, msg: Message):
-        user_id = msg.from_user.id if msg.from_user else None
-        if user_id is None:
+        # Only handle real users (positive IDs), skip bots/channels/anonymous
+        if not msg.from_user:
+            return
+        user_id = msg.from_user.id
+        if user_id <= 0 or msg.from_user.is_bot:
             return
 
         seen = first_message_seen[acc_idx]
 
-        # ── Flood detection ────────────────────────────────────────────────
-        try:
-            messages = [m async for m in c.get_chat_history(user_id, limit=5)]
+        # Flood check — blocks and returns True if spammer detected
+        blocked = await check_flood_and_block(c, user_id, acc_idx)
+        if blocked:
+            return
 
-            if len(messages) >= 5 and all(getattr(m, "sticker", None) for m in messages[:5]):
-                await c.block_user(user_id)
-                await c.delete_chat_history(user_id)
-                logger.info(f"[acc{acc_idx}] Blocked {user_id} — sticker flood")
-                return
-
-            texts = [m.text for m in messages[:5] if m.text]
-            if len(texts) >= 5 and len(set(texts)) == 1:
-                await c.block_user(user_id)
-                await c.delete_chat_history(user_id)
-                logger.info(f"[acc{acc_idx}] Blocked {user_id} — text flood")
-                return
-        except Exception as e:
-            logger.warning(f"[acc{acc_idx}] History check error for {user_id}: {e}")
-
-        # ── First-time message → auto-reply ───────────────────────────────
-        # Only reply if both messages are configured
+        # First-time message → auto-reply (only if both messages configured)
         if user_id not in seen and auto_msg1 is not None and auto_msg2 is not None:
             seen.add(user_id)
             try:
@@ -279,10 +289,13 @@ def build_handlers(client: Client, acc_idx: int):
                 logger.info(f"[acc{acc_idx}] Auto-replied + muted + archived {user_id}")
             except (UserIsBlocked, PeerFlood) as e:
                 logger.warning(f"[acc{acc_idx}] Could not reply to {user_id}: {e}")
+            except (PeerIdInvalid, ValueError, KeyError) as e:
+                logger.debug(f"[acc{acc_idx}] Skipping auto-reply for {user_id}: {e}")
             except Exception as e:
                 logger.error(f"[acc{acc_idx}] Auto-reply error for {user_id}: {e}")
 
 
+# ─── Entry point ───────────────────────────────────────────────────────────────
 async def main():
     sessions = load_sessions()
     if not sessions:
