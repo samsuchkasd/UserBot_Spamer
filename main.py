@@ -8,8 +8,8 @@ from pyrogram.errors import (
     FloodWait, ChatWriteForbidden, SlowmodeWait,
     UserIsBlocked, PeerFlood, ChatAdminRequired,
     UserBannedInChannel, RPCError, PeerIdInvalid,
-    InputUserDeactivated, UserDeactivated, UserDeactivatedBan,
-    FloodPremiumWait, MessageDeleteForbidden, ChannelInvalid,
+    InputUserDeactivated, UserDeactivated,
+    MessageDeleteForbidden, ChannelInvalid,
     UsernameInvalid, UsernameNotOccupied, ChatAdminInviteRequired
 )
 
@@ -222,9 +222,9 @@ async def spam_loop(client, chat_id, chat_title, text, acc_idx, interval_sec):
                 stop_reason = "🔇 Нет прав на отправку (мут или запрет)"; break
             except ChatAdminRequired:
                 stop_reason = "👮 Требуются права администратора"; break
-            except (UserDeactivated, UserDeactivatedBan):
+            except UserDeactivated:
                 stop_reason = "💀 Аккаунт деактивирован Telegram"; break
-            except (FloodWait, FloodPremiumWait) as e:
+            except FloodWait as e:
                 await asyncio.sleep(e.value)
             except asyncio.CancelledError:
                 stop_reason = "⛔️ Остановлен командой /stopspam"; raise
