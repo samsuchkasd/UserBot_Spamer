@@ -41,7 +41,8 @@ auto_msg1: str | None = None
 auto_msg2: str | None = None
 
 CHANNEL_RE = re.compile(
-    r"(?:https?://)?t\.me/([a-zA-Z0-9_]{3,})"
+    r"(?:https?://)?t\.me/c/(\d{7,})(?:/\d+)?"
+    r"|(?:https?://)?t\.me/([a-zA-Z0-9_]{3,})(?:/\d+)?"
     r"|@([a-zA-Z0-9_]{3,})"
     r"|(-100\d{7,})"
 )
@@ -50,7 +51,9 @@ def parse_channel(text: str) -> str | None:
     text = text.strip()
     m = CHANNEL_RE.search(text)
     if m:
-        return m.group(1) or m.group(2) or m.group(3)
+        if m.group(1):
+            return f"-100{m.group(1)}"
+        return m.group(2) or m.group(3) or m.group(4)
     if re.fullmatch(r"-?\d{7,}", text):
         return text
     return None
