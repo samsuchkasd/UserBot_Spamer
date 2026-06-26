@@ -450,6 +450,16 @@ def build_handlers(client: Client, acc_idx: int):
         except Exception as e:
             logger.error(f"[acc{acc_idx}] auto_reply crash: {e}")
 
+# ─── Preload peers (нужно для доступа к приватным каналам по ID) ──────────────────
+async def preload_peers(client: Client, acc_idx: int):
+    try:
+        count = 0
+        async for _ in client.get_dialogs():
+            count += 1
+        logger.info(f"[acc{acc_idx}] Загружено {count} диалогов (access hash кэшированы)")
+    except Exception as e:
+        logger.warning(f"[acc{acc_idx}] preload_peers: {e}")
+
 # ─── Main ────────────────────────────────────────────────────────────────────────
 async def main():
     sessions = load_sessions()
@@ -464,6 +474,7 @@ async def main():
         me = await c.get_me()
         me_ids[idx] = me.id
         logger.info(f"✅ {me.first_name} (@{me.username}) | id={me.id}")
+        await preload_peers(c, idx)
         build_handlers(c, idx)
         clients.append(c)
     logger.info("Все аккаунты запущены.")
