@@ -58,6 +58,23 @@ def parse_channel(text: str) -> str | None:
         return text
     return None
 
+MSG_LINK_RE = re.compile(
+    r"(?:https?://)?t\.me/c/(\d{7,})/(\d+)"
+    r"|(?:https?://)?t\.me/([a-zA-Z0-9_]{3,})/(\d+)"
+)
+
+def parse_message_link(text: str) -> tuple[str, int] | None:
+    """Извлекает (channel, message_id) из ссылки на конкретное сообщение/пост."""
+    text = text.strip()
+    m = MSG_LINK_RE.search(text)
+    if not m:
+        return None
+    if m.group(1) and m.group(2):
+        return f"-100{m.group(1)}", int(m.group(2))
+    if m.group(3) and m.group(4):
+        return m.group(3), int(m.group(4))
+    return None
+
 def make_client(session_string: str, idx: int) -> Client:
     return Client(
         name=f"account_{idx}", api_id=API_ID, api_hash=API_HASH,
@@ -307,6 +324,52 @@ async def download_channel_media(client: Client, channel: str, acc_idx: int):
     media_tasks[acc_idx] = None
     await notify_me(client, f"✅ Готово! «{chat_title}»\n📁 Файлов: {total} | ❌ Ошибок: {failed}")
 
+# ─── Single message/post downloader (по ссылке на конкретное сообщение) ──────────
+async def download_single_message(client: Client, channel: str, message_id: int, acc_idx: int):
+    me_id = me_ids[acc_idx]
+    try:
+        chat = await client.get_chat(channel)
+        chat_title = getattr(chat, "title", str(channel))
+        chat_id = chat.id
+    except (UsernameInvalid, UsernameNotOccupied, ChannelInvalid, PeerIdInvalid, ValueError, KeyError) as e:
+        await notify_me(client, f"❌ Канал не найден: {channel}\n{e}"); return
+    except ChatAdminInviteRequired:
+        await notify_me(client, f"❌ Нет доступа: {channel}"); return
+    except Exception as e:
+        await notify_me(client, f"❌ Ошибка: {e}"); return
+
+    try:
+        target = await client.get_messages(chat_id, message_id)
+    except Exception as e:
+        await notify_me(client, f"❌ Не удалось получить сообщение {message_id}: {e}"); return
+
+    if not target or getattr(target, "empty", False):
+        await notify_me(client, f"❌ Сообщение {message_id} не найдено в «{chat_title}»."); return
+
+    if not target.media or target.media not in MEDIA_TYPES:
+        await notify_me(client, f"❌ В сообщении {message_id} («{chat_title}») нет медиа."); return
+
+    gid = getattr(target, "media_group_id", None)
+    if gid:
+        try:
+            group_msgs = await client.get_media_group(chat_id, message_id)
+        except Exception as e:
+            logger.warning(f"get_media_group {message_id}: {e}")
+            group_msgs = [target]
+        ok, err = await transfer_album(client, chat_id, group_msgs, me_id)
+        if ok:
+            text = f"✅ «{chat_title}», сообщение {message_id}\n📁 Файлов: {ok}"
+            if err: text += f" | ❌ Ошибок: {err}"
+            await notify_me(client, text)
+        else:
+            await notify_me(client, f"❌ Не удалось скачать альбом из сообщения {message_id} («{chat_title}»).")
+    else:
+        ok = await transfer_single(client, chat_id, target, me_id)
+        if ok:
+            await notify_me(client, f"✅ «{chat_title}», сообщение {message_id}\n📁 Скачан 1 файл.")
+        else:
+            await notify_me(client, f"❌ Не удалось скачать медиа из сообщения {message_id} («{chat_title}»).")
+
 # ─── Spam loop ───────────────────────────────────────────────────────────────────
 async def spam_loop(client, chat_id, chat_title, text, acc_idx, interval_sec):
     await notify_me(client,
@@ -388,6 +451,24 @@ def build_handlers(client: Client, acc_idx: int):
         existing = media_tasks.get(acc_idx)
         if existing and not existing.done(): await msg.reply("⚠️ Уже идёт. Останови: /stopmedia"); return
         media_tasks[acc_idx] = asyncio.create_task(download_channel_media(c, channel, acc_idx))
+        try: await msg.delete()
+        except Exception: pass
+
+    @client.on_message(filters.command("getmed", prefixes="/") & mine)
+    async def cmd_getmed(c, msg):
+        parts = msg.text.split(maxsplit=1)
+        if len(parts) < 2:
+            await msg.reply(
+                "Использование:\n"
+                "  /getmed https://t.me/channel/123\n"
+                "  /getmed https://t.me/c/1234567890/123"
+            )
+            return
+        parsed = parse_message_link(parts[1].strip())
+        if not parsed:
+            await msg.reply("❌ Не могу распознать ссылку на сообщение.\nНужна ссылка вида https://t.me/channel/123"); return
+        channel, message_id = parsed
+        asyncio.create_task(download_single_message(c, channel, message_id, acc_idx))
         try: await msg.delete()
         except Exception: pass
 
