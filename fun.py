@@ -16,6 +16,7 @@ import os
 import random
 import re
 import time
+import uuid
 from datetime import datetime, timezone
 
 from pyrogram import Client, filters, enums
@@ -32,6 +33,12 @@ try:
     _ART_OK = True
 except Exception:
     _ART_OK = False
+
+try:
+    import yt_dlp
+    _YTDLP_OK = True
+except Exception:
+    _YTDLP_OK = False
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +140,8 @@ FUN_HELP_TEXT = (
     "📸 **Сторис:**\n"
     "/stori ссылка — скачать конкретный сторис (https://t.me/user/s/123)\n"
     "/allstori @user (или ответом на сообщение) — скачать все сторис профиля\n\n"
+    "💾 **Скачивание из соцсетей:**\n"
+    "/save ссылка — скачать видео/фото (Instagram, TikTok, YouTube, Twitter/X, Pinterest и др.)\n\n"
     "👁 **Слежка за пользователем:**\n"
     "/watch @user — следить за сменой имени/ника/фото\n"
     "/unwatch @user — снять слежку\n"
@@ -156,11 +165,65 @@ def _cleanup(path):
             pass
 
 
-def _stories_dest(msg):
+def _smart_dest(msg):
     """В группе/канале скачанное летит в Избранное, в личке — прямо в переписку."""
     if msg.chat and msg.chat.type == enums.ChatType.PRIVATE:
         return msg.chat.id
     return "me"
+
+
+# оставлено для обратной совместимости внутри файла
+_stories_dest = _smart_dest
+
+
+def _short_err(text: str, limit: int = 300) -> str:
+    text = re.sub(r"^ERROR:\s*", "", (text or "").strip())
+    text = re.sub(r"\s+", " ", text)
+    return text[:limit] + ("…" if len(text) > limit else "")
+
+
+_SAVE_TEMP_DIR = "/tmp/save_dl"
+_SAVE_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+_SAVE_MAX_BYTES = 2 * 1024 * 1024 * 1024  # 2 ГБ — практический потолок для юзербота
+
+
+async def _ytdlp_download(url: str):
+    """Скачивает медиа по ссылке через yt-dlp. Возвращает (путь_к_файлу, info_dict)."""
+    os.makedirs(_SAVE_TEMP_DIR, exist_ok=True)
+    out_tmpl = os.path.join(_SAVE_TEMP_DIR, f"{uuid.uuid4().hex}.%(ext)s")
+    ydl_opts = {
+        "outtmpl": out_tmpl,
+        "format": "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/b",
+        "merge_output_format": "mp4",
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "restrictfilenames": True,
+        "max_filesize": _SAVE_MAX_BYTES,
+        "socket_timeout": 30,
+        "retries": 3,
+    }
+
+    def _dl():
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            if info and "entries" in info:
+                entries = [e for e in info["entries"] if e]
+                if not entries:
+                    raise yt_dlp.utils.DownloadError("Не нашёл медиа по ссылке (пустой пост/плейлист).")
+                info = entries[0]
+            path = ydl.prepare_filename(info)
+            if not os.path.exists(path):
+                base, _ext = os.path.splitext(path)
+                for ext in ("mp4", "mkv", "webm", "jpg", "jpeg", "png", "gif", "mp3", "m4a"):
+                    cand = f"{base}.{ext}"
+                    if os.path.exists(cand):
+                        path = cand
+                        break
+            return path, info
+
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _dl)
 
 
 _STORY_LINK_RE = re.compile(
@@ -895,6 +958,62 @@ def register(client: Client, acc_idx: int, mine, me_id: int):
             text += f" | ❌ Ошибок: {failed}"
         text += f"\n📥 Отправлено {where}."
         await status.edit(text)
+
+    # ---- универсальное скачивание из соцсетей ----
+    @client.on_message(filters.command("save", prefixes="/") & mine)
+    async def cmd_save(c, msg):
+        if not _YTDLP_OK:
+            await msg.reply("❌ Модуль скачивания (yt-dlp) не установлен на сервере."); return
+        parts = msg.text.split(maxsplit=1)
+        arg = parts[1].strip() if len(parts) > 1 else None
+        if not arg and msg.reply_to_message:
+            arg = (msg.reply_to_message.text or msg.reply_to_message.caption or "").strip()
+        m = _SAVE_URL_RE.search(arg or "")
+        if not m:
+            await msg.reply(
+                "Использование: /save <ссылка>\n"
+                "Работает с Instagram, TikTok, YouTube, Twitter/X, Pinterest и многими другими — "
+                "ссылку можно дать аргументом или ответом на сообщение с ней."
+            )
+            return
+        url = m.group(0)
+        dest = _smart_dest(msg)
+        status = await msg.reply("⏳ Скачиваю...")
+        path = None
+        try:
+            path, info = await _ytdlp_download(url)
+            if not path or not os.path.exists(path):
+                await status.edit("❌ Не удалось скачать медиа по этой ссылке."); return
+            size = os.path.getsize(path)
+            if size > _SAVE_MAX_BYTES:
+                await status.edit("❌ Файл больше 2 ГБ — Telegram не пропустит."); return
+            title = (info or {}).get("title") or ""
+            uploader = (info or {}).get("uploader") or (info or {}).get("uploader_id") or ""
+            cap = "💾 Сохранено"
+            extra = " — ".join(filter(None, [uploader, title]))
+            if extra:
+                cap += f"\n{extra[:900]}"
+            ext = os.path.splitext(path)[1].lower().lstrip(".")
+            if ext in ("jpg", "jpeg", "png", "webp"):
+                await c.send_photo(dest, path, caption=cap)
+            elif ext == "gif":
+                await c.send_animation(dest, path, caption=cap)
+            elif ext in ("mp3", "m4a", "ogg", "opus", "flac", "wav"):
+                await c.send_audio(dest, path, caption=cap)
+            else:
+                await c.send_video(dest, path, caption=cap, supports_streaming=True)
+            await status.delete()
+            if dest == "me":
+                await msg.reply("✅ Сохранено в Избранное.")
+        except FloodWait as e:
+            await asyncio.sleep(e.value + 1)
+        except yt_dlp.utils.DownloadError as e:
+            await status.edit(f"❌ Не удалось скачать: {_short_err(str(e))}")
+        except Exception as e:
+            logger.warning(f"[acc{acc_idx}] cmd_save: {e}")
+            await status.edit(f"❌ Ошибка: {_short_err(str(e))}")
+        finally:
+            _cleanup(path)
 
     # ---- слежка за сменой имени/ника/фото ("сангмата") ----
     async def _resolve_watch_target(c, msg):
