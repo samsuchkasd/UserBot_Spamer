@@ -1,2 +1,4 @@
 pyrogram==2.0.106
 TgCrypto==1.2.5
+Pillow>=10.0.0
+art>=6.1

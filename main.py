@@ -2,6 +2,7 @@ import asyncio
 import os
 import re
 import logging
+import fun
 from pyrogram import Client, filters, enums
 from pyrogram.types import (
     Message, InputMediaPhoto, InputMediaVideo,
@@ -413,6 +414,8 @@ def build_handlers(client: Client, acc_idx: int):
     def _is_mine(_, __, msg: Message) -> bool:
         return bool(msg.outgoing) or bool(msg.from_user and msg.from_user.id == my_id)
     mine = filters.create(_is_mine)
+
+    fun.register(client, acc_idx, mine, my_id)
 
     @client.on_message(filters.command("spam", prefixes="/") & mine)
     async def cmd_spam(c, msg):
