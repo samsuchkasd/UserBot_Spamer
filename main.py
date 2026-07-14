@@ -48,15 +48,20 @@ CHANNEL_RE = re.compile(
     r"|(-100\d{7,})"
 )
 
-def parse_channel(text: str) -> str | None:
+def parse_channel(text: str) -> str | int | None:
+    """Возвращает username (str) или numeric chat id (int, всегда int — не str,
+    иначе pyrogram.resolve_peer примет отрицательный id за номер телефона)."""
     text = text.strip()
     m = CHANNEL_RE.search(text)
     if m:
         if m.group(1):
-            return f"-100{m.group(1)}"
-        return m.group(2) or m.group(3) or m.group(4)
+            return int(f"-100{m.group(1)}")
+        if m.group(2) or m.group(3):
+            return m.group(2) or m.group(3)
+        if m.group(4):
+            return int(m.group(4))
     if re.fullmatch(r"-?\d{7,}", text):
-        return text
+        return int(text)
     return None
 
 MSG_LINK_RE = re.compile(
@@ -64,14 +69,15 @@ MSG_LINK_RE = re.compile(
     r"|(?:https?://)?t\.me/([a-zA-Z0-9_]{3,})/(\d+)"
 )
 
-def parse_message_link(text: str) -> tuple[str, int] | None:
-    """Извлекает (channel, message_id) из ссылки на конкретное сообщение/пост."""
+def parse_message_link(text: str) -> tuple[str | int, int] | None:
+    """Извлекает (channel, message_id) из ссылки на конкретное сообщение/пост.
+    channel — int для числового id (не str, иначе resolve_peer примет его за телефон)."""
     text = text.strip()
     m = MSG_LINK_RE.search(text)
     if not m:
         return None
     if m.group(1) and m.group(2):
-        return f"-100{m.group(1)}", int(m.group(2))
+        return int(f"-100{m.group(1)}"), int(m.group(2))
     if m.group(3) and m.group(4):
         return m.group(3), int(m.group(4))
     return None
