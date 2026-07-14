@@ -18,7 +18,7 @@ import re
 import time
 from datetime import datetime, timezone
 
-from pyrogram import Client, filters
+from pyrogram import Client, filters, enums
 from pyrogram.errors import FloodWait
 
 try:
@@ -130,6 +130,9 @@ FUN_HELP_TEXT = (
     "👤 **Профиль:**\n"
     "/whois — инфо о пользователе (ответом или @username)\n"
     "/alive — статус юзербота, пинг, аптайм\n\n"
+    "📸 **Сторис:**\n"
+    "/stori ссылка — скачать конкретный сторис (https://t.me/user/s/123)\n"
+    "/allstori @user (или ответом на сообщение) — скачать все сторис профиля\n\n"
     "👁 **Слежка за пользователем:**\n"
     "/watch @user — следить за сменой имени/ника/фото\n"
     "/unwatch @user — снять слежку\n"
@@ -151,6 +154,79 @@ def _cleanup(path):
             os.remove(path)
         except Exception:
             pass
+
+
+def _stories_dest(msg):
+    """В группе/канале скачанное летит в Избранное, в личке — прямо в переписку."""
+    if msg.chat and msg.chat.type == enums.ChatType.PRIVATE:
+        return msg.chat.id
+    return "me"
+
+
+_STORY_LINK_RE = re.compile(
+    r"^(?:https?://)?(?:www\.)?t(?:elegram)?\.(?:org|me|dog)/c/(\d{5,})(?:/s/(\d+))?/?$",
+    re.IGNORECASE,
+)
+_STORY_USERNAME_LINK_RE = re.compile(
+    r"^(?:https?://)?(?:www\.)?t(?:elegram)?\.(?:org|me|dog)/([a-zA-Z0-9_]{3,32})(?:/s/(\d+))?/?$",
+    re.IGNORECASE,
+)
+
+
+def _parse_story_target(text: str):
+    """Возвращает (chat_ref, story_id_or_None) либо None, если не смогли распознать."""
+    text = (text or "").strip()
+    if not text:
+        return None
+    if text.startswith("@"):
+        text = text[1:]
+    m = _STORY_LINK_RE.match(text)
+    if m:
+        chat_ref = int(f"-100{m.group(1)}")
+        sid = int(m.group(2)) if m.group(2) else None
+        return chat_ref, sid
+    m = _STORY_USERNAME_LINK_RE.match(text)
+    if m:
+        sid = int(m.group(2)) if m.group(2) else None
+        return m.group(1), sid
+    if re.fullmatch(r"-?\d+", text):
+        return int(text), None
+    if re.fullmatch(r"[a-zA-Z0-9_]{3,32}", text):
+        return text, None
+    return None
+
+
+async def _send_story(c, dest, story, msg, silent: bool = False) -> bool:
+    path = None
+    try:
+        path = await c.download_media(story)
+        if not path:
+            if not silent:
+                await msg.reply("❌ Не удалось скачать сторис (нет медиа).")
+            return False
+        author = getattr(story, "from_user", None)
+        author_name = getattr(author, "first_name", None) if author else None
+        cap = f"📸 Сторис #{story.id}"
+        if author_name:
+            cap += f" — {author_name}"
+        story_date = getattr(story, "date", None)
+        if story_date:
+            cap += f"\n🗓 {story_date.strftime('%d.%m.%Y %H:%M')}"
+        if getattr(story, "video", None):
+            await c.send_video(dest, path, caption=cap)
+        else:
+            await c.send_photo(dest, path, caption=cap)
+        return True
+    except FloodWait as e:
+        await asyncio.sleep(e.value + 1)
+        return False
+    except Exception as e:
+        logger.warning(f"send_story: {e}")
+        if not silent:
+            await msg.reply(f"❌ Ошибка при отправке сторис: {e}")
+        return False
+    finally:
+        _cleanup(path)
 
 
 def _is_image_message(m) -> bool:
@@ -725,6 +801,100 @@ def register(client: Client, acc_idx: int, mine, me_id: int):
     @client.on_message(filters.command("funhelp", prefixes="/") & mine)
     async def cmd_funhelp(c, msg):
         await msg.reply(FUN_HELP_TEXT)
+
+    # ---- сторис ----
+    @client.on_message(filters.command("stori", prefixes="/") & mine)
+    async def cmd_stori(c, msg):
+        parts = msg.text.split(maxsplit=1)
+        arg = parts[1].strip() if len(parts) > 1 else None
+        if not arg and msg.reply_to_message:
+            arg = (msg.reply_to_message.text or msg.reply_to_message.caption or "").strip()
+        if not arg:
+            await msg.reply(
+                "Использование:\n"
+                "/stori https://t.me/username/s/123\n"
+                "/stori https://t.me/c/1234567890/s/123"
+            )
+            return
+        parsed = _parse_story_target(arg)
+        if not parsed or parsed[1] is None:
+            await msg.reply(
+                "❌ Нужна ссылка именно на конкретный сторис, вида:\n"
+                "https://t.me/username/s/123"
+            )
+            return
+        chat_ref, story_id = parsed
+        try:
+            story = await c.get_stories(chat_ref, story_id)
+        except Exception as e:
+            await msg.reply(f"❌ Не удалось получить сторис: {e}"); return
+        if not story or getattr(story, "deleted", False) or getattr(story, "skipped", False):
+            await msg.reply("❌ Сторис не найден, удалён или уже недоступен."); return
+        dest = _stories_dest(msg)
+        ok = await _send_story(c, dest, story, msg)
+        if ok and dest == "me":
+            await msg.reply("✅ Сторис сохранён в Избранное.")
+
+    @client.on_message(filters.command("allstori", prefixes="/") & mine)
+    async def cmd_allstori(c, msg):
+        chat_ref = None
+        if msg.reply_to_message and msg.reply_to_message.from_user:
+            chat_ref = msg.reply_to_message.from_user.id
+        else:
+            parts = msg.text.split(maxsplit=1)
+            if len(parts) > 1:
+                parsed = _parse_story_target(parts[1].strip())
+                if parsed:
+                    chat_ref = parsed[0]
+        if chat_ref is None:
+            await msg.reply(
+                "Использование:\n"
+                "/allstori @username\n"
+                "/allstori https://t.me/username\n"
+                "/allstori https://t.me/username/s/123\n"
+                "или ответом на сообщение пользователя в группе"
+            )
+            return
+
+        status = await msg.reply("⏳ Ищу сторис в профиле...")
+        stories = {}
+        try:
+            async for st in c.get_chat_stories(chat_ref):
+                stories[st.id] = st
+        except Exception as e:
+            logger.debug(f"[acc{acc_idx}] get_chat_stories: {e}")
+        try:
+            async for st in c.get_pinned_stories(chat_ref):
+                stories.setdefault(st.id, st)
+        except Exception as e:
+            logger.debug(f"[acc{acc_idx}] get_pinned_stories: {e}")
+
+        if not stories:
+            await status.edit(
+                "❌ Не нашёл доступных сторис (ни активных, ни закреплённых).\n"
+                "Либо у пользователя их нет, либо аккаунт ему незнаком (нет общих чатов/контакта)."
+            )
+            return
+
+        ordered = sorted(stories.values(), key=lambda s: s.id)
+        dest = _stories_dest(msg)
+        ok = failed = 0
+        for st in ordered:
+            if getattr(st, "deleted", False) or getattr(st, "skipped", False):
+                failed += 1
+                continue
+            if await _send_story(c, dest, st, msg, silent=True):
+                ok += 1
+            else:
+                failed += 1
+            await asyncio.sleep(1.5)
+
+        where = "в Избранное" if dest == "me" else "сюда, в переписку"
+        text = f"✅ Готово! Скачано сторис: {ok}"
+        if failed:
+            text += f" | ❌ Ошибок: {failed}"
+        text += f"\n📥 Отправлено {where}."
+        await status.edit(text)
 
     # ---- слежка за сменой имени/ника/фото ("сангмата") ----
     async def _resolve_watch_target(c, msg):
