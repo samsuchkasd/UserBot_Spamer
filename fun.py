@@ -52,6 +52,18 @@ _START_TIME = time.time()
 watch_state: dict[int, dict[int, dict]] = {}
 watch_tasks: dict[int, asyncio.Task] = {}
 
+# ── Иплан: заготовки текстов (замените на свои) ──────────────────────────────
+IPLAN_TEXTS: list[str] = [
+    # ← Вставьте сюда свои тексты, каждый в отдельных кавычках через запятую
+    "Текст 1",
+    "Текст 2",
+    "Текст 3",
+]
+
+# ── состояние Иплан (на аккаунт) ─────────────────────────────────────────────
+# acc_idx -> {chat_id -> asyncio.Task}
+iplan_tasks: dict[int, dict[int, asyncio.Task]] = {}
+
 _DICE_EMOJI = {
     "dice": "🎲",
     "dart": "🎯",
@@ -527,6 +539,59 @@ def _build_quote_card(text: str, author: str, avatar_img):
 def register(client: Client, acc_idx: int, mine, me_id: int):
     if acc_idx not in watch_state:
         watch_state[acc_idx] = {}
+
+    # ── инициализация состояния Иплан ────────────────────────────────────────
+    if acc_idx not in iplan_tasks:
+        iplan_tasks[acc_idx] = {}
+
+    # ── фильтры ──────────────────────────────────────────────────────────────
+    _IPLAN_RE = re.compile(r"иплан", re.IGNORECASE)
+    _STOP_RE  = re.compile(r"^стоп$", re.IGNORECASE)
+
+    def _has_iplan(_, __, msg) -> bool:
+        return bool(_IPLAN_RE.search(msg.text or msg.caption or ""))
+
+    def _is_stop(_, __, msg) -> bool:
+        return bool(_STOP_RE.match((msg.text or "").strip()))
+
+    iplan_filter = filters.create(_has_iplan)
+    stop_filter  = filters.create(_is_stop)
+
+    @client.on_message(iplan_filter & mine)
+    async def cmd_iplan(c, msg):
+        chat_id = msg.chat.id
+        existing = iplan_tasks[acc_idx].get(chat_id)
+        if existing and not existing.done():
+            # уже активен в этом чате — молча игнорируем
+            return
+        if not IPLAN_TEXTS:
+            await msg.reply("❌ Список IPLAN_TEXTS пуст — добавьте тексты в fun.py.")
+            return
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+        iplan_tasks[acc_idx][chat_id] = asyncio.create_task(
+            _iplan_loop(c, chat_id, acc_idx)
+        )
+
+    @client.on_message(stop_filter & mine)
+    async def cmd_stop_iplan(c, msg):
+        tasks = iplan_tasks.get(acc_idx, {})
+        active = {cid: t for cid, t in tasks.items() if not t.done()}
+        if not active:
+            # Иплан не запущен — не мешаем слову "Стоп" использоваться свободно
+            return
+        for task in active.values():
+            task.cancel()
+        tasks.clear()
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+        await c.send_message("me",
+            f"⛔️ Иплан остановлен ({len(active)} чат(ов))."
+        )
 
     # ---- игры (анимированные кости Telegram) ----
     for cmd_name, emoji in _DICE_EMOJI.items():
@@ -1118,3 +1183,59 @@ async def _watch_loop(client: Client, acc_idx: int, interval: int = 300):
         except Exception as e:
             logger.warning(f"[acc{acc_idx}] watch loop: {e}")
         await asyncio.sleep(interval)
+
+
+# ── Иплан: основной цикл ─────────────────────────────────────────────────────
+async def _iplan_loop(client: Client, chat_id: int, acc_idx: int):
+    """
+    Циклически отправляет тексты из IPLAN_TEXTS в chat_id.
+    Параллельно поддерживает статус «печатает…» и читает входящие.
+    Останавливается по CancelledError (команда «Стоп»).
+    """
+    idx = 0
+    last_typing = 0.0
+    try:
+        while True:
+            now = asyncio.get_event_loop().time()
+
+            # Обновляем «печатает…» каждые 4 с (действие длится 5 с)
+            if now - last_typing >= 4.0:
+                try:
+                    await client.send_chat_action(chat_id, "typing")
+                    last_typing = asyncio.get_event_loop().time()
+                except Exception:
+                    pass
+
+            # Читаем сообщения → двойные галочки
+            try:
+                await client.read_chat_history(chat_id)
+            except Exception:
+                pass
+
+            # Отправляем текст (циклически по списку)
+            text = IPLAN_TEXTS[idx % len(IPLAN_TEXTS)]
+            try:
+                await client.send_message(chat_id, text)
+                idx += 1
+            except FloodWait as e:
+                # Telegram просит подождать — слушаемся и продолжаем
+                await asyncio.sleep(e.value + 1)
+                continue
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(f"[acc{acc_idx}] iplan send to {chat_id}: {e}")
+                await asyncio.sleep(1)
+                continue
+
+            await asyncio.sleep(0.1)
+
+    except asyncio.CancelledError:
+        pass
+    finally:
+        # Убираем статус «печатает…» и чистим словарь задач
+        try:
+            await client.send_chat_action(chat_id, "cancel")
+        except Exception:
+            pass
+        iplan_tasks.get(acc_idx, {}).pop(chat_id, None)
